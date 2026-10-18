@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import shutil
 import subprocess
 import time
@@ -17,16 +18,19 @@ from fwagent.dynamic.models import DynamicEvidence, is_canonical_runtime_evidenc
 from fwagent.dynamic.prioritization import HypothesisValidationScheduler
 from fwagent.dynamic.service import reconstruct_service_startup
 from fwagent.dynamic.surface import AttackSurfaceBuilder
+from fwagent.dynamic.surface_contract import surface_counts
 from fwagent.dynamic.synthesis import HypothesisSynthesizer
 from fwagent.dynamic.taint import TaintAnalysisBuilder
 from fwagent.dynamic.workspace import DynamicWorkspace
 from fwagent.findings import FindingFinalizer
 from fwagent.pipeline.analyzer import analyze_firmware
+from fwagent.pipeline.context import WorkspaceStateError, validate_workspace_input
 from fwagent.reporting.final_report import ReportGenerator, ReportValidator, REPORT_SCHEMA_VERSION
 from fwagent.reporting.json_report import load_analysis_json, save_analysis_json
 from fwagent.runtime.ghidra import GhidraRuntime
+from fwagent.runtime.scanning import ScanTimeoutError, recover_interrupted_scan, remaining_scan_seconds, run_bounded_scan, scan_budget, scan_owner_active
 from fwagent.tools import analyze_binaries, discover_services, discover_web_surface, identify_architecture, inventory_filesystem, rank_binaries, scan_sensitive_files
-from fwagent.tools.common import is_windows_reparse_point, safe_exists, safe_is_dir, sha256_file
+from fwagent.tools.common import _raise_walk_error, is_elf, is_regular_file, is_scan_directory, safe_exists, safe_is_dir, sha256_file
 from fwagent.tools.extractor import find_rootfs_candidates
 from fwagent.tools.ghidra_api import BinaryToolAPI
 
@@ -82,12 +86,18 @@ class PipelineStageResult:
     duration: float = 0.0
     input_artifacts: list[str] = field(default_factory=list)
     output_artifacts: list[str] = field(default_factory=list)
-    items_processed: int = 0
+    items_processed: int | None = 0
     items_succeeded: int = 0
     items_failed: int = 0
     items_skipped: int = 0
     blocking_reason: str | None = None
     partial_reason: str | None = None
+    item_count_status: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.stage == "ATTACK_SURFACE" and self.item_count_status is None and self.items_processed == 0:
+            self.items_processed = None
+            self.item_count_status = "not_executed" if self.status in {"pending", "skipped", "blocked"} else "unknown"
 
     def start(self) -> None:
         self.started_at = utc_now_iso()
@@ -237,6 +247,7 @@ class AnalysisPipelineController:
         output_dir: str | Path | None = None,
         progress: bool = True,
         timeout: int = 600,
+        scan_timeout: float | None = None,
     ) -> dict[str, Any]:
         started = time.monotonic()
         source = Path(firmware)
@@ -245,12 +256,31 @@ class AnalysisPipelineController:
             if not task:
                 return self._invalid(str(source), task_id, "RESUME_STATE_INVALID", "resume task not found")
             source = Path(task.input_path)
+            if not source.exists():
+                stored = self.workspace_root / task_id / "input" / task.firmware_name
+                if is_regular_file(stored):
+                    source = stored
         if not source.exists():
             return self._invalid(str(source), task_id, "INPUT_NOT_FOUND", "firmware input not found")
         input_hash = sha256_file(source)
         task_id = task_id or self._new_task_id(input_hash)
         task_dir = self.workspace_root / task_id
-        task = self.load_task(task_id) if resume else None
+        existing_task = self.load_task(task_id)
+        if not resume and (existing_task or (task_dir / "input").exists()):
+            return self._invalid(str(source), task_id, "TASK_EXISTS", "task already exists; use --resume or a new task id")
+        if resume:
+            if existing_task and existing_task.status == "running" and scan_owner_active(task_dir):
+                return self._invalid(str(source), task_id, "TASK_RUNNING", "task owner is still alive; cannot resume concurrently")
+            try:
+                validate_workspace_input(task_dir, source, task_id)
+            except (WorkspaceStateError, OSError, ValueError) as exc:
+                return self._invalid(str(source), task_id, "RESUME_STATE_INVALID", str(exc))
+            if existing_task and existing_task.pipeline_phase == "completed":
+                saved = _load_json_if_exists(task_dir / "pipeline_summary.json")
+                if not isinstance(saved, dict) or saved.get("task_id") != task_id:
+                    return self._invalid(str(source), task_id, "RESUME_STATE_INVALID", "completed task summary is missing or invalid; existing reports preserved")
+                return {**saved, "resume_reused_complete": True}
+        task = existing_task if resume else None
         analysis_mode = "fast" if fast else "deep" if deep else "static-only" if static_only else "no-dynamic" if no_dynamic else "normal"
         if not task:
             task = AnalysisTask(
@@ -275,26 +305,27 @@ class AnalysisPipelineController:
             self._run_stage(stage_results, "INPUT_PREPARE", timings, lambda: self._prepare_input_stage(task, source), progress, "[1/8] Preparing firmware\n[1/15] FirmXplore input preparation")
             self._run_stage(stage_results, "ENVIRONMENT_CHECK", timings, lambda: self._environment_stage(task), progress, "[2/15] FirmXplore environment check")
 
-            if not resume or not (task_dir / "reports" / "analysis.json").exists():
-                self._phase(task, "static_analysis", "running")
-                self._run_stage(
-                    stage_results,
-                    "EXTRACTION",
-                    timings,
-                    lambda: analyze_firmware(source, workspace=self.workspace_root, timeout=timeout, task_id=task_id),
-                    progress,
-                    "[3/15] Extracting firmware and building base inventory",
-                )
-            else:
-                self._skip_stage(stage_results, "EXTRACTION", "resume reused existing reports/analysis.json")
-                timings["extraction"] = 0.0
+            with scan_budget(scan_timeout, event_path=task_dir / "scan_events.jsonl"):
+                if not resume or not (task_dir / "reports" / "analysis.json").exists():
+                    self._phase(task, "static_analysis", "running")
+                    self._run_stage(
+                        stage_results,
+                        "EXTRACTION",
+                        timings,
+                        lambda: analyze_firmware(source, workspace=self.workspace_root, timeout=timeout, task_id=task_id, resume=resume),
+                        progress,
+                        "[3/15] Extracting firmware and building base inventory",
+                    )
+                else:
+                    self._skip_stage(stage_results, "EXTRACTION", "resume reused existing reports/analysis.json")
+                    timings["extraction"] = 0.0
 
-            rootfs_artifact = self._ensure_canonical_rootfs(task_id, source, stage_results, timings, errors, timeout=timeout)
-            inventory_result: dict[str, Any] | None = None
-            if rootfs_artifact:
-                inventory_result = self._run_stage(stage_results, "ROOTFS_INVENTORY", timings, lambda: self._refresh_inventory_for_canonical_rootfs(task_id, rootfs_artifact), progress, "[4/15] Canonical rootfs inventory")
-            else:
-                self._block_stage(stage_results, "ROOTFS_INVENTORY", "no canonical rootfs established")
+                rootfs_artifact = self._ensure_canonical_rootfs(task_id, source, stage_results, timings, errors, timeout=timeout)
+                inventory_result: dict[str, Any] | None = None
+                if rootfs_artifact:
+                    inventory_result = self._run_stage(stage_results, "ROOTFS_INVENTORY", timings, lambda: self._refresh_inventory_for_canonical_rootfs(task_id, rootfs_artifact), progress, "[4/15] Canonical rootfs inventory")
+                else:
+                    self._block_stage(stage_results, "ROOTFS_INVENTORY", "no canonical rootfs established")
 
             inventory_ready = bool(inventory_result and inventory_result.get("success"))
             if inventory_ready:
@@ -395,6 +426,16 @@ class AnalysisPipelineController:
             task.pipeline_phase = "interrupted"
             self._save_task(task)
             raise
+        except ScanTimeoutError as exc:
+            task.status = "failed"
+            task.pipeline_phase = "failed"
+            task.error = self._error("BASE_SCAN_TIMEOUT", str(exc), recoverable=True)
+            try:
+                self._save_task(task)
+            except OSError as state_error:
+                logging.getLogger(__name__).warning("cannot save base scan timeout state: %s", state_error)
+            return {"success": False, "exit_code": EXIT_PIPELINE_FAILURE, "error": task.error,
+                    "scan_status": "timed_out", "task": task.to_dict(), "provider_backed": False}
         except Exception as exc:  # noqa: BLE001
             task.status = "failed"
             task.pipeline_phase = "failed"
@@ -420,6 +461,8 @@ class AnalysisPipelineController:
         self._progress(progress, message)
         result = stages[stage]
         result.start()
+        if stage == "ATTACK_SURFACE":
+            result.item_count_status = "unknown"
         started = time.monotonic()
         try:
             value = func()
@@ -427,6 +470,12 @@ class AnalysisPipelineController:
             if stage == "STATIC_TARGET_SELECTION" and not outputs:
                 outputs = ["ghidra/targets.json"]
             items = _items_processed(value)
+            if stage == "ATTACK_SURFACE":
+                payload = value if isinstance(value, dict) else {}
+                counts = surface_counts(payload.get("summary", payload), payload.get("entry_points"))
+                items = counts["candidate_entries_total"]
+                result.item_count_status = counts["count_status"]
+                result.items_processed = items
             status = "completed"
             blocking_reason = None
             partial_reason = None
@@ -443,14 +492,16 @@ class AnalysisPipelineController:
                 if "items_skipped" in value:
                     items_skipped = int(value.get("items_skipped") or 0)
             if isinstance(value, dict) and value.get("success") is False:
-                status = str(value.get("stage_status") or status or ("blocked" if value.get("blocking_reason") else "partial"))
+                status = str(value.get("stage_status") or ("blocked" if value.get("blocking_reason") else "failed"))
+                if status == "completed":
+                    status = "failed"
                 blocking_reason = value.get("blocking_reason")
                 partial_reason = value.get("partial_reason") or value.get("error")
                 if "items_succeeded" not in value:
                     items_succeeded = 0
-                if status in {"blocked", "skipped"}:
+                if status in {"blocked", "skipped"} and "items_skipped" not in value:
                     items_skipped = items or 1
-                else:
+                elif "items_failed" not in value:
                     items_failed = items
             elif isinstance(value, dict) and status in {"partial", "blocked", "skipped"}:
                 blocking_reason = value.get("blocking_reason")
@@ -468,6 +519,10 @@ class AnalysisPipelineController:
             )
             timings[_stage_timing_key(stage)] = result.duration
             return value
+        except ScanTimeoutError:
+            result.finish("timed_out", blocking_reason="base scan deadline exceeded", started_monotonic=started)
+            timings[_stage_timing_key(stage)] = result.duration
+            raise
         except Exception:
             result.finish("failed", blocking_reason="stage raised an exception", started_monotonic=started)
             timings[_stage_timing_key(stage)] = result.duration
@@ -556,7 +611,8 @@ class AnalysisPipelineController:
         report = load_analysis_json(report_path)
         attempts: list[dict[str, Any]] = []
         extraction = report.get("extraction", {}) if isinstance(report.get("extraction"), dict) else {}
-        primary_candidates = [extraction.get("rootfs")] + list(extraction.get("rootfs_candidates") or [])
+        primary_candidates = ([extraction.get("rootfs")] + list(extraction.get("rootfs_candidates") or [])
+                              if extraction.get("success") is True else [])
         primary = select_canonical_rootfs_candidate(primary_candidates, task_dir=task_dir)
         attempts.append(
             {
@@ -651,42 +707,11 @@ class AnalysisPipelineController:
         return artifact
 
     def _docker_extract_rootfs(self, task_id: str, source: Path, *, timeout: int) -> dict[str, Any]:
-        if not shutil.which("docker"):
-            return {"success": False, "error_code": "DOCKER_CLI_NOT_FOUND", "error": "Docker extraction fallback requires Docker, but the docker CLI was not found."}
-        task_dir = self.workspace_root / task_id
-        output_dir = task_dir / "docker-extract"
-        output_dir.mkdir(parents=True, exist_ok=True)
-        source_abs = source.resolve()
-        command = [
-            "docker",
-            "run",
-            "--rm",
-            "--network",
-            "none",
-            "-v",
-            f"{source_abs.parent}:/input:ro",
-            "-v",
-            f"{output_dir.resolve()}:/output",
-            "-w",
-            "/output",
-            "--entrypoint",
-            "binwalk",
-            self.round2_config.ghidra.docker_image,
-            "-e",
-            "--run-as=root",
-            f"/input/{source_abs.name}",
-        ]
-        try:
-            completed = subprocess.run(command, text=True, capture_output=True, timeout=timeout)
-        except (OSError, subprocess.SubprocessError) as exc:
-            return {"success": False, "error_code": _classify_docker_error(str(exc)), "error": str(exc), "command": command}
-        (task_dir / "docker_extract.out").write_text((completed.stdout or "") + (completed.stderr or ""), encoding="utf-8")
-        candidates = find_rootfs_candidates(output_dir)
-        selected = select_canonical_rootfs_candidate(candidates, task_dir=task_dir)
-        if not selected:
-            output = (completed.stderr or completed.stdout or "docker binwalk produced no rootfs")[:2000]
-            return {"success": False, "error_code": _classify_docker_error(output), "error": output, "exit_code": completed.returncode, "candidates": [str(item) for item in candidates]}
-        return {"success": True, "rootfs": str(selected["host_path"]), "validation": selected, "method": "docker-binwalk", "exit_code": completed.returncode, "candidates": [str(item) for item in candidates]}
+        # A killed Docker client does not terminate daemon-owned containers.
+        # Keep this fallback closed until a quota-backed worker and durable
+        # cancellation/cleanup supervisor have both been implemented and tested.
+        return {"success": False, "error_code": "UNMANAGED_CONTAINER_EXECUTION_BLOCKED",
+                "error": "Docker extraction disabled: output quota and daemon cleanup supervision are unavailable; use bounded static archive extraction."}
 
     def _try_embedded_firmware_rootfs(self, task_id: str, source: Path, attempts: list[dict[str, Any]], *, timeout: int) -> dict[str, Any]:
         task_dir = self.workspace_root / task_id
@@ -841,6 +866,10 @@ class AnalysisPipelineController:
         return artifact
 
     def _refresh_inventory_for_canonical_rootfs(self, task_id: str, rootfs_artifact: RootfsArtifact | None) -> dict[str, Any]:
+        return run_bounded_scan("canonical_inventory", _refresh_inventory_worker, self.workspace_root,
+                                self.config, self.round2_config, self.product_config, task_id, rootfs_artifact)
+
+    def _refresh_inventory_scan(self, task_id: str, rootfs_artifact: RootfsArtifact | None) -> dict[str, Any]:
         task_dir = self.workspace_root / task_id
         report = load_analysis_json(task_dir / "reports" / "analysis.json")
         if not rootfs_artifact:
@@ -855,17 +884,17 @@ class AnalysisPipelineController:
                 "items_processed": validation.get("file_count", 0),
                 "output_artifacts": ["reports/analysis.json"],
             }
-        filesystem = inventory_filesystem(rootfs)
+        filesystem = run_bounded_scan("canonical.filesystem", inventory_filesystem, rootfs)
         elf_files = filesystem.get("categories", {}).get("elf", [])
         if filesystem.get("total_files", 0) <= 0:
             return {"success": False, "stage_status": "partial", "partial_reason": "canonical rootfs inventory produced zero files", "items_processed": 0, "output_artifacts": ["reports/analysis.json"]}
-        architecture = identify_architecture(rootfs, elf_files)
-        services = discover_services(rootfs).get("services", [])
-        web = discover_web_surface(rootfs)
+        architecture = run_bounded_scan("canonical.architecture", identify_architecture, rootfs, elf_files)
+        services = run_bounded_scan("canonical.services", discover_services, rootfs).get("services", [])
+        web = run_bounded_scan("canonical.web", discover_web_surface, rootfs)
         selected_elf = _select_lightweight_static_binary_paths(elf_files, services, web)
-        binaries = analyze_binaries(rootfs, selected_elf)
+        binaries = run_bounded_scan("canonical.binaries", analyze_binaries, rootfs, selected_elf)
         priority = rank_binaries(binaries, services, web)
-        security_candidates = scan_sensitive_files(rootfs)
+        security_candidates = run_bounded_scan("canonical.secrets", scan_sensitive_files, rootfs)
         platform = {
             "architecture": architecture.get("primary_architecture"),
             "endianness": architecture.get("endianness"),
@@ -980,38 +1009,50 @@ class AnalysisPipelineController:
         analyses: list[dict[str, Any]] = []
         evidence = DynamicWorkspace(self.workspace_root, task_id).load_evidence()
         existing_ids = {item.id for item in evidence}
-        for target in targets:
-            if not target.get("exists"):
-                analyses.append(
-                    {
-                        "target": target,
-                        "success": False,
-                        "errors": ["target does not exist"],
-                        "requested_backend": "ghidra",
-                        "backend_used": "none",
-                        "real_ghidra": False,
-                        "fallback_used": False,
-                        "fallback_reason": "TARGET_NOT_FOUND",
-                        "status": "failed",
-                    }
-                )
-                continue
-            result = api.analyze_binary(target["host_path"], allow_fallback=True)
-            result["target"] = target
-            backend = _ghidra_backend_details(result)
-            result.update(backend)
+        for index, target in enumerate(targets):
+            started_at = utc_now_iso()
+            started = time.monotonic()
+            result = {"target": target, "success": False, "status": "running", "started_at": started_at}
             analyses.append(result)
-            evidence_ids_for_target = []
-            for item in _ghidra_evidence_for_result(result):
-                evidence_ids_for_target.append(item.id)
-                if item.id not in existing_ids:
-                    evidence.append(item)
-                    existing_ids.add(item.id)
-            result["evidence_ids"] = evidence_ids_for_target
+            _atomic_json(ghidra_dir / "target_status.json", {"batch_complete": False, "scheduled": len(targets), "analyses": analyses})
+            try:
+                if not target.get("exists"):
+                    value = {"success": False, "errors": ["target does not exist"], "result": {}, "error_code": "TARGET_NOT_FOUND"}
+                else:
+                    value = api.analyze_binary(target["host_path"], allow_fallback=True)
+                    if not isinstance(value, dict) or not isinstance(value.get("success"), bool):
+                        raise ValueError("invalid binary tool result schema")
+                if value.get("binary") and Path(value["binary"]).resolve() != Path(target.get("host_path", "")).resolve():
+                    raise ValueError("tool result target differs from scheduled binary")
+                value["target"] = target
+                value.update(_ghidra_backend_details(value))
+                produced = _ghidra_evidence_for_result(value)
+                value["evidence_ids"] = [item.id for item in produced]
+                for item in produced:
+                    if item.id not in existing_ids:
+                        evidence.append(item)
+                        existing_ids.add(item.id)
+                result.update(value)
+                if not result.get("success"):
+                    metadata = (result.get("result") or {}).get("metadata") or {}
+                    result["error_code"] = result.get("error_code") or metadata.get("error_code") or _ghidra_failure_reason(result.get("errors", []))
+                elif result.get("fallback_used"):
+                    result["error_code"] = result.get("fallback_reason")
+            except Exception as exc:
+                code = getattr(exc, "code", None) or ("GHIDRA_JSON_INVALID" if isinstance(exc, (json.JSONDecodeError, UnicodeError)) else "GHIDRA_TIMEOUT" if isinstance(exc, TimeoutError) else "GHIDRA_OUTPUT_MISSING" if isinstance(exc, FileNotFoundError) else "GHIDRA_TARGET_ERROR")
+                result.update(success=False, errors=[f"{type(exc).__name__}: {exc}"], error_code=code,
+                              result={}, backend_used="none", real_ghidra=False, fallback_used=False,
+                              fallback_reason=code, status="failed", evidence_ids=[])
+            finally:
+                result.update(started_at=started_at, finished_at=utc_now_iso(), duration=round(time.monotonic() - started, 3))
+                result["execution_status"] = "completed" if result.get("success") and result.get("real_ghidra") else "degraded" if result.get("success") else "skipped" if result.get("error_code") == "TARGET_NOT_FOUND" else "timed_out" if result.get("error_code") == "GHIDRA_TIMEOUT" else "failed"
+                result["status"] = result["execution_status"]
+                _atomic_json(ghidra_dir / "target_status.json", {"batch_complete": index + 1 == len(targets), "scheduled": len(targets), "analyses": analyses})
         DynamicWorkspace(self.workspace_root, task_id).save_evidence(evidence)
         scheduled = len(targets)
         analyzed = sum(1 for item in analyses if item.get("success"))
-        failed = sum(1 for item in analyses if not item.get("success"))
+        skipped = sum(1 for item in analyses if item.get("execution_status") == "skipped")
+        failed = sum(1 for item in analyses if not item.get("success") and item.get("execution_status") != "skipped")
         real_completed = sum(1 for item in analyses if item.get("real_ghidra") and item.get("success"))
         fallback_completed = sum(1 for item in analyses if item.get("fallback_used") and item.get("success"))
         timed_out = sum(1 for item in analyses if item.get("fallback_reason") == "GHIDRA_TIMEOUT" or any("timeout" in str(error).lower() for error in item.get("errors", [])))
@@ -1034,7 +1075,7 @@ class AnalysisPipelineController:
         else:
             stage_status = "blocked"
             partial_reason = None
-            blocking_reason = "real Ghidra worker unavailable and no fallback analysis completed"
+            blocking_reason = "no target completed with real Ghidra or fallback; see per-target failure reasons"
         fallback_reasons: dict[str, int] = {}
         for item in analyses:
             reason = item.get("fallback_reason")
@@ -1042,7 +1083,7 @@ class AnalysisPipelineController:
                 fallback_reasons[str(reason)] = fallback_reasons.get(str(reason), 0) + 1
         worker_detail = _first_ghidra_worker_detail(analyses)
         summary = {
-            "success": stage_status not in {"blocked", "failed"},
+            "success": stage_status == "completed",
             "stage_status": stage_status,
             "partial_reason": partial_reason,
             "blocking_reason": blocking_reason,
@@ -1069,7 +1110,11 @@ class AnalysisPipelineController:
             "items_processed": scheduled,
             "items_succeeded": real_completed,
             "items_failed": failed,
-            "items_skipped": 0,
+            "items_skipped": skipped,
+            "items_degraded": fallback_completed,
+            "batch_complete": True,
+            "execution_completed": True,
+            "failure_reasons": {str(item["target"].get("path")): item.get("error_code") for item in analyses if not item.get("success")},
         }
         (ghidra_dir / "analysis_summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         (ghidra_dir / "evidence.json").write_text(json.dumps([item.to_dict() for item in evidence], indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -1157,6 +1202,11 @@ class AnalysisPipelineController:
         ghidra = _load_json_if_exists(task_dir / "ghidra" / "analysis_summary.json")
         graph = _load_json_if_exists(task_dir / "correlation" / "summary.json")
         surface = _load_json_if_exists(task_dir / "surface" / "attack_surface_summary.json")
+        surface = surface_counts(
+            surface,
+            _load_json_if_exists(task_dir / "surface" / "entry_points.json"),
+            _load_json_if_exists(task_dir / "surface" / "routes.json"),
+        )
         taint = _load_json_if_exists(task_dir / "taint" / "summary.json")
         synthesis = _load_json_if_exists(task_dir / "hypotheses" / "summary.json")
         findings = _load_json_if_exists(task_dir / "findings" / "findings.json")
@@ -1215,8 +1265,9 @@ class AnalysisPipelineController:
             "ghidra_fallback": ghidra_fallback,
             "component_count": graph.get("total_components", graph.get("summary", {}).get("total_components", 0)),
             "relationship_count": graph.get("total_relationships", graph.get("summary", {}).get("total_relationships", 0)),
-            "surface_entries": surface.get("entry_points", surface.get("total_entry_points", 0)),
-            "runtime_confirmed_entries": surface.get("runtime_confirmed_entries", 0),
+            # Compatibility alias: surface_entries counts candidate objects.
+            "surface_entries": surface["candidate_entries_total"],
+            **surface,
             "taint_sources": taint.get("sources", 0),
             "sensitive_sinks": taint.get("sinks", 0),
             "candidate_taint_paths": taint.get("candidate_paths", 0),
@@ -1275,10 +1326,10 @@ class AnalysisPipelineController:
         task = self.load_task(task_id)
         if task:
             task.report_paths = paths
-            task.pipeline_phase = "completed"
-            task.status = "completed"
             self._save_task(task)
-        return {"success": True, "task_id": task_id, "report_paths": paths, "artifact_manifest": manifest.relative_to(self.workspace_root / task_id).as_posix(), "provider_backed": False}
+        return {"success": True, "report_generation_status": "completed", "task_id": task_id,
+                "task_status": task.status if task else None, "pipeline_phase": task.pipeline_phase if task else None,
+                "report_paths": paths, "artifact_manifest": manifest.relative_to(self.workspace_root / task_id).as_posix(), "provider_backed": False}
 
     def status(self, task_id: str) -> dict[str, Any]:
         task = self.load_task(task_id)
@@ -1331,7 +1382,13 @@ class AnalysisPipelineController:
         path = self.workspace_root / task_id / "task.json"
         if not path.exists():
             return None
-        return AnalysisTask(**json.loads(path.read_text(encoding="utf-8")))
+        task = AnalysisTask(**json.loads(path.read_text(encoding="utf-8")))
+        if task.status == "running" and task.pipeline_phase == "static_analysis" and recover_interrupted_scan(path.parent):
+            task.status = "paused"
+            task.pipeline_phase = "interrupted"
+            task.error = self._error("SCAN_OWNER_EXITED", "scan owner exited; explicit resume required", recoverable=True)
+            self._save_task(task)
+        return task
 
     def _static_artifacts(self, task_id: str, errors: list[dict[str, Any]], timings: dict[str, float]) -> None:
         builders = [
@@ -1353,7 +1410,7 @@ class AnalysisPipelineController:
     def _save_task(self, task: AnalysisTask) -> None:
         task_dir = self.workspace_root / task.task_id
         task_dir.mkdir(parents=True, exist_ok=True)
-        (task_dir / "task.json").write_text(json.dumps(task.to_dict(), indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        _atomic_json(task_dir / "task.json", task.to_dict())
 
     def _phase(self, task: AnalysisTask, phase: str, status: str) -> None:
         if phase not in PIPELINE_PHASES:
@@ -1462,6 +1519,11 @@ class AnalysisPipelineController:
         return {path.suffix.lstrip("."): path.relative_to(self.workspace_root / task_id).as_posix() for path in reports_dir.glob("report.*") if path.is_file()}
 
 
+def _refresh_inventory_worker(workspace, config, round2_config, product_config, task_id, rootfs):
+    controller = AnalysisPipelineController(workspace, config=config, round2_config=round2_config, product_config=product_config)
+    return controller._refresh_inventory_scan(task_id, rootfs)
+
+
 def parse_report_formats(value: str | None) -> set[str] | None:
     if not value or value == "all":
         return None
@@ -1474,6 +1536,10 @@ def parse_report_formats(value: str | None) -> set[str] | None:
 
 
 def validate_rootfs_candidate(candidate: str | Path) -> dict[str, Any]:
+    return run_bounded_scan("rootfs_validation", _validate_rootfs_candidate, candidate)
+
+
+def _validate_rootfs_candidate(candidate: str | Path) -> dict[str, Any]:
     path = Path(candidate)
     result: dict[str, Any] = {
         "path": str(path),
@@ -1514,12 +1580,8 @@ def validate_rootfs_candidate(candidate: str | Path) -> dict[str, Any]:
             except OSError:
                 continue
             file_count += 1
-            try:
-                with file_path.open("rb") as handle:
-                    if handle.read(4) == b"\x7fELF":
-                        elf_count += 1
-            except OSError:
-                continue
+            if is_elf(file_path):
+                elf_count += 1
     score = score_rootfs_candidate(markers=markers, file_count=file_count, elf_count=elf_count)
     result.update(
         {
@@ -1554,6 +1616,10 @@ def score_rootfs_candidate(*, markers: list[str], file_count: int, elf_count: in
 
 
 def select_canonical_rootfs_candidate(candidates: list[str | Path | None], *, task_dir: Path) -> dict[str, Any] | None:
+    return run_bounded_scan("canonical_selection", _select_canonical_rootfs_candidate, candidates, task_dir=task_dir)
+
+
+def _select_canonical_rootfs_candidate(candidates: list[str | Path | None], *, task_dir: Path) -> dict[str, Any] | None:
     scored = []
     for raw in candidates:
         if not raw:
@@ -1595,25 +1661,19 @@ def normalize_extraction_path(value: str | Path, *, task_dir: Path) -> Path:
 def _safe_walk(root: Path):
     import os
 
-    for current, dirnames, filenames in os.walk(root, followlinks=False):
+    for current, dirnames, filenames in os.walk(root, followlinks=False, onerror=_raise_walk_error):
         current_path = Path(current)
         kept = []
         for dirname in dirnames:
             path = current_path / dirname
-            try:
-                if not path.is_symlink() and not is_windows_reparse_point(path):
-                    kept.append(dirname)
-            except OSError:
-                continue
+            if is_scan_directory(path):
+                kept.append(dirname)
         dirnames[:] = kept
         kept_files = []
         for filename in filenames:
             path = current_path / filename
-            try:
-                if not path.is_symlink() and not is_windows_reparse_point(path):
-                    kept_files.append(filename)
-            except OSError:
-                continue
+            if is_regular_file(path):
+                kept_files.append(filename)
         yield current, dirnames, kept_files
 
 
@@ -1623,6 +1683,10 @@ def _looks_like_container_only_path(path: Path) -> bool:
 
 
 def _embedded_firmware_candidates(task_dir: Path, original_source: Path) -> list[Path]:
+    return run_bounded_scan("embedded_candidates", _scan_embedded_firmware_candidates, task_dir, original_source)
+
+
+def _scan_embedded_firmware_candidates(task_dir: Path, original_source: Path) -> list[Path]:
     extensions = {".bin", ".trx", ".img", ".chk", ".fw", ".upgrade"}
     candidates: list[Path] = []
     search_roots = [task_dir / "extracted", task_dir / "prepared_input"]
@@ -1632,7 +1696,7 @@ def _embedded_firmware_candidates(task_dir: Path, original_source: Path) -> list
             continue
         for path in root.rglob("*"):
             try:
-                if not path.is_file() or path.suffix.lower() not in extensions:
+                if not is_regular_file(path) or path.suffix.lower() not in extensions:
                     continue
                 resolved = path.resolve()
                 if resolved == original or resolved.stat().st_size < 1024 * 1024:
@@ -1713,6 +1777,10 @@ def _items_processed(value: Any) -> int:
         return 0
     if "items_processed" in value:
         return int(value.get("items_processed") or 0)
+    if "entry_points" in value or "total_entries" in value or "candidate_entries_total" in value:
+        return surface_counts(value.get("summary", value), value.get("entry_points"))["candidate_entries_total"] or 0
+    if isinstance(value.get("summary"), dict) and any(key in value["summary"] for key in ("total_entries", "candidate_entries_total", "entry_points")):
+        return surface_counts(value["summary"])["candidate_entries_total"] or 0
     for key in ("analyzed_binary_count", "selected_binary_count", "selected_static_targets", "files_extracted", "total_components", "component_count", "total_relationships", "relationship_count"):
         if key in value:
             return int(value.get(key) or 0)
@@ -1876,7 +1944,7 @@ def _ghidra_backend_details(result: dict[str, Any]) -> dict[str, Any]:
     metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
     fallback_used = bool(metadata.get("fallback") or metadata.get("fallback_used"))
     real_ghidra = bool(metadata.get("real_ghidra")) and not fallback_used and bool(result.get("success"))
-    fallback_reason = metadata.get("fallback_reason")
+    fallback_reason = metadata.get("fallback_reason") or metadata.get("error_code") or result.get("error_code")
     errors = result.get("errors") or []
     if fallback_used and not fallback_reason:
         fallback_reason = "UNKNOWN_GHIDRA_FAILURE"
@@ -1919,3 +1987,9 @@ def _ghidra_failure_reason(errors: list[Any]) -> str:
     if "script" in text:
         return "GHIDRA_SCRIPT_FAILED"
     return "UNKNOWN_GHIDRA_FAILURE"
+
+
+def _atomic_json(path: Path, payload: Any) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    temporary.replace(path)

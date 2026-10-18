@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import os
 import re
 import shlex
 import shutil
@@ -13,6 +14,9 @@ import urllib.error
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
+
+from fwagent.tools.common import open_regular_file, safe_read_text
+from fwagent.dynamic.guest_paths import GuestPathError, GuestRoot, create_private_root, guest_parts, guest_path, require_secure_writes
 
 
 SERVICE_EVIDENCE_TYPES = {
@@ -226,6 +230,7 @@ def reconstruct_service_startup(rootfs: str | Path, binary: str) -> ServiceLaunc
     required_paths.extend(config_files)
     document_root = config.get("server.document-root")
     if isinstance(document_root, str):
+        guest_parts(document_root)
         required_paths.append(document_root)
     writable_paths = sorted(
         {
@@ -265,7 +270,7 @@ def parse_lighttpd_config(path: str | Path) -> dict[str, Any]:
     config_path = Path(path)
     if not config_path.exists():
         return {}
-    text = config_path.read_text(encoding="utf-8", errors="ignore")
+    text = safe_read_text(config_path, limit=-1)
     parsed: dict[str, Any] = {}
     lines = text.splitlines()
     index = 0
@@ -528,30 +533,41 @@ def assess_service_runtime_feasibility(
     )
 
 
+def _copy_runtime_regular(source, target):
+    with open_regular_file(Path(source)) as handle, Path(target).open("xb") as output:
+        mode = os.fstat(handle.fileno()).st_mode & 0o777
+        shutil.copyfileobj(handle, output)
+    Path(target).chmod(mode)
+    return str(target)
+
+
 def prepare_service_rootfs(
     source_rootfs: str | Path,
     service_rootfs: str | Path,
     profile: ServiceLaunchProfile,
 ) -> dict[str, Any]:
-    source = Path(source_rootfs)
-    target = Path(service_rootfs)
-    marker = target / ".firmxplore-runtime-copy.json"
-    if target.exists() and not marker.exists():
-        shutil.rmtree(target, ignore_errors=True)
-    reused = target.exists() and marker.exists()
-    if not reused:
-        shutil.copytree(
-            source,
-            target,
-            symlinks=True,
-            ignore_dangling_symlinks=True,
-            ignore=lambda current, names: {name for name in names if Path(current) == source and name in {"dev", "proc", "sys"}},
-        )
+    # Validate every config-derived path before any mutation, even on hosts
+    # without secure write primitives. Fresh copies never adopt marker files.
+    for value in [profile.binary, *profile.config_files, *profile.required_paths, *profile.writable_paths]:
+        guest_parts(value)
+    source = guest_path(source_rootfs, "/")
+    target = Path(service_rootfs).absolute()
+    require_secure_writes()
+    create_private_root(target)
+    for child in source.iterdir():
+        if child.name in {"dev", "proc", "sys", ".firmxplore-runtime-copy.json"}:
+            continue
+        # Preserve links as links; never use their targets as writable paths.
+        if child.is_symlink():
+            (target / child.name).symlink_to(child.readlink())
+        elif child.is_dir():
+            shutil.copytree(child, target / child.name, symlinks=True, ignore_dangling_symlinks=True, copy_function=_copy_runtime_regular)
+        elif child.is_file():
+            _copy_runtime_regular(child, target / child.name)
     repairs: list[RuntimeRepair] = []
     for pseudo_path in ("/dev", "/proc", "/sys"):
-        candidate = _root_path(target, pseudo_path)
-        if not candidate.exists():
-            candidate.mkdir(parents=True, exist_ok=True)
+        with GuestRoot(target) as owned:
+            owned.mkdir(pseudo_path)
         repairs.append(
             RuntimeRepair(
                 id=f"RR-{len(repairs) + 1:04d}",
@@ -585,14 +601,12 @@ def prepare_service_rootfs(
                     fidelity_limitations=["directory lifecycle is reconstructed outside vendor init"],
                 )
             )
-    marker.write_text(
-        json.dumps({"source_rootfs": str(source), "source_rootfs_modified": False, "complete": True}, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    with GuestRoot(target) as owned:
+        owned.write_new("/.firmxplore-runtime-copy.json", (json.dumps({"source_rootfs": str(source), "source_rootfs_modified": False, "complete": True}, indent=2, sort_keys=True) + "\n").encode())
     return {
         "success": True,
         "service_rootfs": str(target),
-        "reused": reused,
+        "reused": False,
         "repairs": [repair.to_dict() for repair in repairs],
     }
 
@@ -612,27 +626,16 @@ def _path_is_real_directory(path: Path) -> bool:
 
 
 def _materialize_directory(root: Path, target: Path) -> None:
-    relative = target.relative_to(root)
-    current = root
-    for part in relative.parts:
-        current = current / part
-        if _path_is_real_directory(current):
-            continue
-        _remove_inaccessible_path(current)
-        current.mkdir(parents=True, exist_ok=True)
+    try:
+        relative = target.relative_to(root).as_posix()
+    except ValueError:
+        raise GuestPathError("runtime directory is outside the owned root") from None
+    with GuestRoot(root) as owned:
+        owned.mkdir(relative)
 
 
 def _remove_inaccessible_path(path: Path) -> None:
-    try:
-        if path.is_dir() and not path.is_symlink():
-            shutil.rmtree(path, ignore_errors=True)
-            return
-    except OSError:
-        pass
-    try:
-        path.unlink(missing_ok=True)
-    except OSError:
-        shutil.rmtree(path, ignore_errors=True)
+    raise GuestPathError("automatic removal of conflicting runtime paths is forbidden")
 
 
 def classify_service_failure(stdout: str, stderr: str, exit_code: int | None, timed_out: bool = False) -> str:
@@ -713,7 +716,7 @@ def detect_nvram_dependencies(rootfs: Path, firmware_paths: list[str | None]) ->
         path = _root_path(rootfs, firmware_path)
         if not path.exists() or not path.is_file():
             continue
-        text = path.read_text(encoding="utf-8", errors="ignore")
+        text = safe_read_text(path, limit=-1)
         for line in text.splitlines():
             if "nvram" in line.lower():
                 dependencies.append(
@@ -788,6 +791,7 @@ def save_json(path: str | Path, payload: dict[str, Any]) -> None:
 
 
 def _resolve_binary(rootfs: Path, binary: str) -> str:
+    guest_parts(binary)
     if binary.startswith("/"):
         return binary
     for prefix in ("/usr/sbin", "/usr/bin", "/sbin", "/bin"):
@@ -803,7 +807,7 @@ def _find_startup_command(rootfs: Path, service: str, binary_path: str) -> tuple
         for path in sorted(init_dir.iterdir()):
             if not path.is_file():
                 continue
-            text = path.read_text(encoding="utf-8", errors="ignore")
+            text = safe_read_text(path, limit=-1)
             if service not in text and binary_path not in text:
                 continue
             for line in text.splitlines():
@@ -821,7 +825,7 @@ def _find_startup_command(rootfs: Path, service: str, binary_path: str) -> tuple
                     return f"/etc/init.d/{path.name}", parts[1:]
     inetd = rootfs / "etc" / "inetd.conf"
     if inetd.exists():
-        for line in inetd.read_text(encoding="utf-8", errors="ignore").splitlines():
+        for line in safe_read_text(inetd, limit=-1).splitlines():
             if not line.strip() or line.lstrip().startswith("#"):
                 continue
             try:
@@ -844,6 +848,7 @@ def _config_files_from_args(arguments: list[str]) -> list[str]:
     files = []
     for index, item in enumerate(arguments):
         if item == "-f" and index + 1 < len(arguments):
+            guest_parts(arguments[index + 1])
             files.append(arguments[index + 1])
     return files
 
@@ -861,13 +866,16 @@ def _writable_paths_from_config(config: dict[str, Any]) -> list[str]:
     paths = []
     for key in ("server.pid-file", "server.errorlog"):
         value = config.get(key)
-        if isinstance(value, str) and value.startswith("/"):
-            paths.append(str(Path(value).parent).replace("\\", "/"))
+        if value is not None:
+            parts = guest_parts(value)
+            if not parts:
+                raise GuestPathError("log/PID configuration requires a guest file path")
+            paths.append("/" + "/".join(parts[:-1]))
     return paths
 
 
 def _root_path(rootfs: Path, firmware_path: str) -> Path:
-    return rootfs / firmware_path.lstrip("/")
+    return guest_path(rootfs, firmware_path)
 
 
 def _strip_comment(line: str) -> str:

@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from fwagent.tools.common import display_path, is_elf, is_windows_reparse_point, read_prefix
+from fwagent.tools.common import _raise_walk_error, display_path, is_elf, is_regular_file, is_scan_directory, is_windows_reparse_point, read_prefix
 
 
 SCRIPT_EXTENSIONS = {".sh", ".py", ".lua", ".php", ".pl", ".cgi", ".asp"}
@@ -14,11 +14,16 @@ LIB_PATTERNS = (".so", ".so.")
 
 
 def inventory_filesystem(rootfs: str | Path) -> dict:
-    root = Path(rootfs).resolve()
+    root = Path(rootfs).absolute()
+    root.stat(follow_symlinks=False)
+    if not is_scan_directory(root):
+        raise NotADirectoryError(f"rootfs must be an ordinary directory: {root}")
+    root = root.resolve()  # normalize Windows short names after rejecting linked roots
     counts = {
         "total_files": 0,
         "directories": 0,
         "symlinks": 0,
+        "special_files_skipped": 0,
         "elf_files": 0,
         "scripts": 0,
         "config_files": 0,
@@ -41,27 +46,24 @@ def inventory_filesystem(rootfs: str | Path) -> dict:
         "libraries": [],
     }
 
-    for current, dirnames, filenames in os.walk(root, followlinks=False):
+    for current, dirnames, filenames in os.walk(root, followlinks=False, onerror=_raise_walk_error):
         current_path = Path(current)
         kept_dirs = []
         for dirname in dirnames:
             path = current_path / dirname
-            try:
-                if path.is_symlink() or is_windows_reparse_point(path):
-                    counts["symlinks"] += 1
-                    continue
+            if is_scan_directory(path):
                 kept_dirs.append(dirname)
-            except OSError:
-                continue
+            else:
+                counts["symlinks"] += 1
         dirnames[:] = kept_dirs
         counts["directories"] += len(kept_dirs)
         for filename in filenames:
             path = current_path / filename
-            try:
+            if not is_regular_file(path):
                 if path.is_symlink() or is_windows_reparse_point(path):
                     counts["symlinks"] += 1
-                    continue
-            except OSError:
+                else:
+                    counts["special_files_skipped"] += 1
                 continue
             _inventory_regular_file(path, root, counts, categories)
 

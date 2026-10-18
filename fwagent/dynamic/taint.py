@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
 from collections import Counter, deque
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -13,6 +14,8 @@ from fwagent.dynamic.config import DynamicConfig
 from fwagent.dynamic.correlation import CanonicalStateGuard, ComponentGraphBuilder
 from fwagent.dynamic.models import DynamicEvidence
 from fwagent.dynamic.surface import AttackSurfaceBuilder
+from fwagent.dynamic.static_audit import GhidraEvidenceIndex
+from fwagent.dynamic.static_evidence import EvidenceValidationError, rootfs_relative_path
 from fwagent.dynamic.workspace import DynamicWorkspace
 
 logger = logging.getLogger(__name__)
@@ -110,6 +113,7 @@ TAINT_STATES = {
 }
 
 TAINT_EDGE_TYPES = {
+    "callgraph_edge",
     "passes_to",
     "returns_to",
     "copied_to",
@@ -371,6 +375,9 @@ class DataFlowEvidence:
     artifact_reference: str | None = None
     provenance: str = "real_static_analysis"
     evidence_level: str = "L0_source_sink_exist"
+    analysis_status: str | None = None
+    static_evidence: list[dict[str, Any]] = field(default_factory=list)
+    limitations: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if self.evidence_level not in EVIDENCE_LEVELS:
@@ -530,6 +537,14 @@ class StaticDataFlowBridge:
     def __init__(self, config: DynamicConfig, registry: SensitiveSinkRegistry | None = None):
         self.config = config
         self.registry = registry or SensitiveSinkRegistry()
+
+    def audit_exported_candidate(self, task_dir: str | Path, *, task_id: str, path_id: str) -> dict[str, Any]:
+        """Read saved evidence without constructing a builder or mutating a task.
+
+        The legacy text/regex bridge is deliberately not used to invent missing
+        SSA, callsites or argument mappings for v1 Ghidra exports.
+        """
+        return GhidraEvidenceIndex(task_dir, task_id=task_id).audit_candidate(path_id)
 
     def analyze_same_function_flow(
         self,
@@ -701,6 +716,7 @@ class TaintAnalysisBuilder:
             "summary": summary.to_dict(),
             "contexts": [item.to_dict() for item in contexts],
         }
+        payload["summary"]["static_evidence_diagnostics"] = getattr(self, "_static_evidence_diagnostics", [])
         self._persist(payload)
         return payload
 
@@ -971,7 +987,8 @@ class TaintAnalysisBuilder:
                         binary_path=path,
                         function_name=self.registry.normalize_symbol(str(symbol)),
                         callee_name=self.registry.normalize_symbol(str(symbol)),
-                        argument_index=0,
+                        # The registry identifies an API, not observed call arguments.
+                        argument_index=None,
                         operation=f"imported or referenced {symbol}",
                         evidence_ids=[f"BIN:{path}"],
                         confidence=0.62,
@@ -1189,55 +1206,42 @@ class TaintAnalysisBuilder:
         graph: TaintGraph,
         data_flow_evidence: list[DataFlowEvidence],
     ) -> list[TaintPath]:
-        """在 Ghidra callgraph 中搜索"网络输入接收函数 → 危险函数"的可达调用链。
+        """Address-keyed call relationships; receiver controllability is unknown.
 
-        起点不是 source 描述符里的抽象函数名（入口描述符没有真实函数名），
-        而是 callgraph 中实际调用 recv/recvfrom/read/fgets 等接收函数的 caller——
-        那是二进制接收外部输入的真实位置。证据级别 L2_reachable_call_chain：
-        调用链真实存在，但参数传播关系未验证（L3 需要反编译级数据流）。
-        每个 sink 只保留最优链（见 _cap_generic_paths），防止候选洪水。
+        Paths stay L2 candidates. Neither a receiver label nor a call relation
+        establishes source values reaching the dangerous sink argument.
         """
         callgraphs = self._load_callgraphs()
-        if not callgraphs:
-            return []
-
         generated: list[TaintPath] = []
         for sink in sinks:
-            if not sink.callee_name:
+            if not sink.callee_name or not sink.binary_path:
                 continue
-            binary_name = self._sink_binary_name(sink)
-            adjacency = callgraphs.get(binary_name)
-            if not adjacency:
+            export = callgraphs.binary(sink.binary_path)
+            if export is None:
                 continue
-            # 该二进制的"外部输入接收 caller"（调用了 recv/read/... 的函数）
-            entry_callers = self._network_entry_callers(adjacency)
-            if not entry_callers:
+            chain_edges = export.receiver_chain(sink.callee_name, max_depth=4)
+            if not chain_edges:
                 continue
-            # 绑定该二进制的最佳 source 描述符（保持 source/sink 语义与统计）
-            source = self._source_for_binary(sources, sink.component_id, binary_name)
+            binary_name = self._path_basename(sink.binary_path)
+            source = self._source_for_binary(sources, sink.component_id, export.identity.rootfs_path)
             if source is None:
+                callgraphs.diagnostics.append(f"{export.identity.rootfs_path}: no source with an exact binary path identity")
                 continue
-            best_chain: list[str] | None = None
-            for caller in sorted(entry_callers):
-                chain = self._callgraph_chain(adjacency, caller, sink.callee_name, max_depth=4)
-                if chain and (best_chain is None or len(chain) < len(best_chain)):
-                    best_chain = chain
-            if not best_chain:
-                continue
-
+            best_chain = [edge.observation["caller"] for edge in chain_edges] + [chain_edges[-1].observation["callee"]]
             confidence = round(min(source.confidence, sink.confidence) * 0.75, 3)
             src_tag = _slug(source.source_id)[:24]
             edge_id = f"TE-GEN-{src_tag}-{_slug(sink.sink_id)}"
-            graph.add_edge(TaintEdge(edge_id, source.source_id, sink.sink_id, "calls_with", sorted(set(source.evidence_ids + sink.evidence_ids)), confidence))
+            graph.add_edge(TaintEdge(edge_id, source.source_id, sink.sink_id, "callgraph_edge", sorted(set(source.evidence_ids + sink.evidence_ids)), confidence))
             path_id = f"TP-GEN-{src_tag}-{_slug(sink.sink_id)}"
+            flow_key = hashlib.sha256((export.identity.identity_id + path_id).encode()).hexdigest()[:16]
             evidence = DataFlowEvidence(
-                evidence_id=f"DFE-{_slug(path_id)}",
+                evidence_id=f"DFE-{_slug(path_id)[:48]}-{flow_key}",
                 source_id=source.source_id,
                 sink_id=sink.sink_id,
                 function=" -> ".join(best_chain[:4]),
                 observation_type="callgraph_reachable_input_to_sink",
                 decompile_excerpt_summary=(
-                    f"network input receiver {best_chain[0]} reaches {sink.callee_name} in {binary_name} "
+                    f"receiver-labelled caller {best_chain[0]} reaches {sink.callee_name} in {export.identity.rootfs_path} "
                     f"via {' -> '.join(best_chain[:5])}; callchain-level evidence, arguments unverified"
                 ),
                 argument_mapping={},
@@ -1245,6 +1249,9 @@ class TaintAnalysisBuilder:
                 confidence=confidence,
                 artifact_reference=f"ghidra callgraph: {binary_name}",
                 evidence_level="L2_reachable_call_chain",
+                analysis_status="callgraph_only",
+                static_evidence=[edge.to_dict() for edge in chain_edges],
+                limitations=["Source controllability, callsite arguments, parameter propagation and mitigation coverage unverified"],
             )
             data_flow_evidence.append(evidence)
             generated.append(
@@ -1267,6 +1274,7 @@ class TaintAnalysisBuilder:
                     runtime_sink_confirmed=False,
                 )
             )
+        self._static_evidence_diagnostics = list(callgraphs.diagnostics) + [message for export in callgraphs.binaries for message in export.diagnostics]
         return generated
 
     @staticmethod
@@ -1292,24 +1300,21 @@ class TaintAnalysisBuilder:
         return callers
 
     def _source_for_binary(
-        self, sources: list[InputSourceDescriptor], component_id: str | None, binary_name: str
+        self, sources: list[InputSourceDescriptor], component_id: str | None, binary_path: str
     ) -> InputSourceDescriptor | None:
-        """为 sink 挑选同一二进制的 source 描述符。
-
-        组件 id 尾段是二进制名（C-BINARY-sbin-httpd → httpd，
-        C-SERVICE-httpd → httpd，C-BINARY-htdocs-cgibin → cgibin），
-        只接受尾段精确匹配，避免出现 "telnetd source → cgibin sink" 的错误关联。
-        """
-        if not component_id:
-            return None
-        sink_token = self._component_binary_token(component_id)
-        if not sink_token:
-            return None
+        """Bind explicit component file/service metadata; basename is insufficient."""
+        target = rootfs_relative_path(binary_path)
         best: InputSourceDescriptor | None = None
         for source in sources:
             if source.source_id.startswith("SRC-RET2TEXT") or not source.component_id:
                 continue
-            if self._component_binary_token(source.component_id) != sink_token:
+            component = self.graph.components.get(source.component_id)
+            path = (component.path or component.metadata.get("binary")) if component else None
+            try:
+                same = rootfs_relative_path(path) == target
+            except EvidenceValidationError:
+                same = False
+            if not same:
                 continue
             if best is None or source.confidence > best.confidence:
                 best = source
@@ -1319,30 +1324,8 @@ class TaintAnalysisBuilder:
     def _component_binary_token(component_id: str) -> str:
         return component_id.rstrip("/").split("-")[-1].lower() if component_id else ""
 
-    def _load_callgraphs(self) -> dict[str, dict[str, set[str]]]:
-        """从 ghidra/analysis_summary.json 提取每二进制的 caller→callee 邻接表。"""
-        summary_path = self.workspace.task_dir / "ghidra" / "analysis_summary.json"
-        if not summary_path.exists():
-            return {}
-        try:
-            summary = json.loads(summary_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return {}
-        result: dict[str, dict[str, set[str]]] = {}
-        for analysis in summary.get("analyses") or []:
-            binary = str(analysis.get("binary") or "")
-            if not binary:
-                continue
-            edges = (analysis.get("result") or {}).get("callgraph") or []
-            adjacency: dict[str, set[str]] = {}
-            for edge in edges:
-                caller = str(edge.get("caller") or "")
-                callee = str(edge.get("callee") or "")
-                if caller and callee:
-                    adjacency.setdefault(caller, set()).add(callee)
-            if adjacency:
-                result[self._path_basename(binary)] = adjacency
-        return result
+    def _load_callgraphs(self) -> GhidraEvidenceIndex:
+        return GhidraEvidenceIndex(self.workspace.task_dir, task_id=self.workspace.task_id)
 
     @staticmethod
     def _callgraph_chain(adjacency: dict[str, set[str]], start: str, goal: str, *, max_depth: int) -> list[str] | None:
@@ -1544,8 +1527,21 @@ class TaintAnalysisBuilder:
 
 
 def _unique_sinks(sinks: list[SensitiveSink]) -> list[SensitiveSink]:
+    # Preserve legacy IDs when unambiguous; disambiguate every conflicting path
+    # deterministically before deduplication, rather than dropping a same-name ELF.
+    paths: dict[str, set[str]] = {}
+    slugs: dict[str, set[tuple[str, str | None]]] = {}
+    for sink in sinks:
+        path = rootfs_relative_path(sink.binary_path) if sink.binary_path else None
+        if sink.binary_path:
+            paths.setdefault(sink.sink_id, set()).add(path)
+        slugs.setdefault(_slug(sink.sink_id), set()).add((sink.sink_id, path))
     by_id = {}
     for sink in sinks:
+        if (sink.binary_path and len(paths[sink.sink_id]) > 1) or len(slugs[_slug(sink.sink_id)]) > 1:
+            material = f"{rootfs_relative_path(sink.binary_path) if sink.binary_path else ''}\0{sink.sink_id}"
+            suffix = hashlib.sha256(material.encode()).hexdigest()[:16]
+            sink = replace(sink, sink_id=sink.sink_id[:60] + "-" + suffix)
         by_id.setdefault(sink.sink_id, sink)
     return list(by_id.values())
 

@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import time
+import os
+import shutil
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from fwagent.runtime.command import CommandRunner
+from fwagent.tools.common import is_regular_file, is_scan_directory
 
 
 @dataclass
@@ -77,54 +81,58 @@ class UserspaceImageBuilder(FirmwareImageBuilder):
         size_mb: int = 256,
     ) -> ImageBuildResult:
         start = time.monotonic()
-        root = Path(rootfs)
-        output = Path(output_path)
-        if not root.is_dir():
+        commands = []
+        output = None
+        def failed(message):
             return ImageBuildResult(
-                success=False,
-                output_path=output,
-                filesystem_type="ext4",
-                image_size_mb=size_mb,
-                builder=self.name,
-                duration=round(time.monotonic() - start, 3),
-                errors=[f"rootfs directory not found: {root}"],
+                False, output, "ext2", size_mb, self.name, round(time.monotonic() - start, 3),
+                [message[:2000]], {"commands": commands},
             )
-        output.parent.mkdir(parents=True, exist_ok=True)
-        if output.exists():
-            output.unlink()
-        # 关键：mke2fs -d 直接读 Windows bind mount 会丢失大量文件
-        # （特殊 inode stat 失败被跳过，/bin 下的 ELF 几乎全丢）。
-        # 先把 rootfs 复制到容器本地 overlayfs 再构建，构建才可靠。
-        stage = "/tmp/rootfs_build"
-        self.runner.run(["sh", "-c", f"rm -rf {stage} && mkdir -p {stage}"], timeout=60)
-        self.runner.run(
-            ["sh", "-c", f"cp -a {rootfs}/. {stage}/ 2>/dev/null || true"],
-            timeout=600,
-        )
-        command = [
-            "mke2fs",
-            "-t",
-            # FirmAE 的 2.6 内核没有 ext4 驱动（内核日志 do_mount type:ext3），
-            # ext2（无 extents/journal）在 2.6 与 4.1 内核上均可挂载
-            "ext2",
-            "-F",
-            "-d",
-            stage,
-            str(output),
-            f"{size_mb}M",
-        ]
-        result = self.runner.run(command, timeout=300)
-        success = result.exit_code == 0 and output.exists()
+        try:
+            if type(size_mb) is not int or size_mb <= 0:
+                return failed("image size must be a positive integer")
+            root, output = Path(rootfs).absolute(), Path(output_path).absolute()
+            if not is_scan_directory(root):
+                return failed("rootfs must be an ordinary directory")
+            # Never remove an existing user image, including a dangling link.
+            if output.exists() or output.is_symlink():
+                return failed("image output already exists; choose a fresh path")
+            # Local staging preserves Linux semantics when rootfs is on a bind
+            # mount. TemporaryDirectory owns this unique tree, never a global
+            # /tmp/rootfs_build shared with other users/runs.
+            with tempfile.TemporaryDirectory(prefix="firmxplore-rootfs-") as temporary:
+                staging = Path(temporary)
+                stage = staging / "rootfs"
+                stage.mkdir()
+                copy_command = ["cp", "-a", "--", str(root) + os.sep + ".", str(stage) + os.sep]
+                commands.append(copy_command)
+                copied = self.runner.run(copy_command, timeout=600)
+                if copied.exit_code != 0 or getattr(copied, "timed_out", False):
+                    return failed("rootfs copy failed: " + str(copied.stderr or copied.stdout or "no diagnostic"))
+                image = staging / "image.ext2"
+                command = ["mke2fs", "-t", "ext2", "-F", "-d", str(stage), str(image), f"{size_mb}M"]
+                commands.append(command)
+                result = self.runner.run(command, timeout=300)
+                if result.exit_code != 0 or getattr(result, "timed_out", False) or not is_regular_file(image):
+                    return failed("mke2fs failed: " + str(result.stderr or result.stdout or "output missing"))
+                output.parent.mkdir(parents=True, exist_ok=True)
+                # Exclusive publish also rejects an output created while the
+                # copy/build was running. No original output is overwritten.
+                with image.open("rb") as source, output.open("xb") as destination:
+                    shutil.copyfileobj(source, destination)
+        except (OSError, ValueError, TypeError) as exc:
+            return failed(f"image build failed: {type(exc).__name__}: {exc}")
         return ImageBuildResult(
-            success=success,
+            success=True,
             output_path=output,
             filesystem_type="ext2",
             image_size_mb=size_mb,
             builder=self.name,
             duration=round(time.monotonic() - start, 3),
-            errors=[] if success else [(result.stderr or result.stdout or "mke2fs failed")[:2000]],
+            errors=[],
             metadata={
                 "command": command,
+                "commands": commands,
                 "rootfs": str(root),
                 "exit_code": result.exit_code,
             },

@@ -1,9 +1,9 @@
 import java.io.FileWriter;
 import java.security.MessageDigest;
-import ghidra.app.script.GhidraScript;
+import ghidra.app.util.headless.HeadlessScript;
 import ghidra.program.model.listing.FunctionIterator;
 
-public class ExportBinarySummary extends GhidraScript {
+public class ExportBinarySummary extends HeadlessScript {
     public void run() throws Exception {
         String[] args = getScriptArgs();
         String output = args.length > 0 ? args[0] : "summary.json";
@@ -22,7 +22,7 @@ public class ExportBinarySummary extends GhidraScript {
             + "\"imports\":[],"
             + "\"exports\":[],"
             + "\"interesting_strings\":[],"
-            + "\"analysis_timed_out\":false"
+            + "\"analysis_timed_out\":" + analysisTimeoutOccurred()
             + "}";
         try (FileWriter writer = new FileWriter(output)) {
             writer.write(json);

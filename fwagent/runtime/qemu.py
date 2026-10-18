@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from fwagent.runtime.execution_policy import deny_unisolated_execution
+
 import os
 import shutil
 from pathlib import Path
@@ -28,6 +30,7 @@ class QemuRuntime:
             "warnings": ["KVM unavailable; software emulation only"] if not checks["kvm"] else [],
         }
 
+    @deny_unisolated_execution
     def start(self, firmware_path: str | Path, *, arch: str = "arm") -> dict[str, Any]:
         environment = self.check_environment()
         if not environment["success"]:

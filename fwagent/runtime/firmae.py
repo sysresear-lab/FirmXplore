@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from fwagent.runtime.execution_policy import deny_unisolated_execution
+
 import os
 import shutil
 import time
@@ -47,6 +49,7 @@ class FirmAERuntime:
             shutil.copy2(source, target)
         return {"success": True, "firmware": str(source), "prepared": str(target)}
 
+    @deny_unisolated_execution
     def boot(self, firmware_path: str | Path, *, timeout: int = 300, brand: str = "router") -> dict[str, Any]:
         environment = self.check_environment()
         if not environment["success"]:

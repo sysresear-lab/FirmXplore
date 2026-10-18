@@ -2,13 +2,17 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
+import stat
 from collections import Counter, deque
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
+from fwagent.tools.common import is_scan_directory, read_prefix, safe_read_text
+from fwagent.dynamic.surface_contract import EVIDENCE_LEVELS, surface_counts
 from fwagent.dynamic.config import DynamicConfig
 from fwagent.dynamic.correlation import (
     CanonicalStateGuard,
@@ -55,14 +59,23 @@ _SERVICE_HINTS = {
 # Ghidra 证据中代表"接收外部输入"的网络调用（用于 network-caller 二进制入口）
 _NET_FUNCS = (
     "socket", "bind", "listen", "accept", "recv", "recvfrom", "recvmsg",
-    "select", "poll", "epoll_wait", "read",
 )
+# Explicit libc aliases only. Generic FD operations (read/select/poll) do not
+# establish network capability. Symbol versions do not change API identity.
+_NET_ALIASES = {f"__libc_{name}": name for name in _NET_FUNCS}
+
+
+def _network_api(symbol: str) -> str | None:
+    name = symbol.split("@", 1)[0]
+    return name if name in _NET_FUNCS else _NET_ALIASES.get(name)
 
 # 网络调用二进制入口的置信度（低于 config_declared，高于纯猜测）
 _NETWORK_CALLER_CONFIDENCE = 0.6
 
 
 ENTRY_POINT_TYPES = {
+    "network_capability_candidate",
+    "binary_candidate",
     "http_route",
     "https_route",
     "cgi",
@@ -136,6 +149,17 @@ class EntryPoint:
     evidence_ids: list[str] = field(default_factory=list)
     relationship_ids: list[str] = field(default_factory=list)
     created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    evidence_level: str = "unknown"
+    classification_status: str = "unconfirmed"
+    filesystem_path: str | None = None
+    url_path: str | None = None
+    symlink_target: str | None = None
+    candidate_file_entity: str | None = None
+    candidate_handler_component_id: str | None = None
+    handler_dispatch_confirmed: bool = False
+    unresolved_reason: str | None = None
+    api_matches: list[dict[str, Any]] = field(default_factory=list)
+    evidence_details: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.entry_type not in ENTRY_POINT_TYPES:
@@ -147,6 +171,13 @@ class EntryPoint:
         self.confidence = _clamp01(self.confidence)
         self.evidence_ids = sorted(set(self.evidence_ids))
         self.relationship_ids = sorted(set(self.relationship_ids))
+        if self.evidence_level not in EVIDENCE_LEVELS:
+            raise ValueError(f"invalid entry evidence_level: {self.evidence_level}")
+        if self.evidence_level == "runtime_confirmed" and not self.runtime_confirmed:
+            raise ValueError("runtime_confirmed evidence requires runtime_confirmed=True")
+        if self.runtime_confirmed:
+            self.evidence_level = "runtime_confirmed"
+            self.classification_status = "runtime_confirmed"
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -245,7 +276,7 @@ class InputSource:
     source_type: str
     exposure_scope: str
     description: str
-    network_exposed: bool
+    network_exposed: bool | None
     runtime_confirmed: bool
     evidence_ids: list[str] = field(default_factory=list)
 
@@ -321,6 +352,14 @@ class AttackSurfaceSummary:
     entries_by_exposure_scope: dict[str, int]
     entry_priority_ranking: list[dict[str, Any]]
     safety_notes: list[str]
+    candidate_entries_total: int = 0
+    file_or_symlink_candidates: int = 0
+    api_inferred_candidates: int = 0
+    heuristic_candidates: int = 0
+    unknown_evidence_candidates: int = 0
+    route_mappings_total: int = 0
+    http_route_candidates: int = 0
+    count_schema_version: str = "firmxplore.surface.counts.v2"
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -406,6 +445,8 @@ class AttackSurfaceBuilder:
             entry_contexts=contexts,
         )
         payload = surface.to_dict()
+        if hasattr(self, "_ghidra_input_status"):
+            payload["summary"]["ghidra_input_status"] = self._ghidra_input_status
         self._persist(payload)
         return {"success": True, **payload}
 
@@ -705,9 +746,9 @@ class AttackSurfaceBuilder:
             try:
                 if not _is_readable_file(cfg) or cfg.stat().st_size > 512 * 1024:
                     continue  # 跳过超大/设备文件，只解析文本配置
-                if b"\x00" in cfg.read_bytes()[:4096]:
+                if b"\x00" in read_prefix(cfg, 4096):
                     continue  # 二进制文件跳过
-                text = cfg.read_text(errors="ignore")
+                text = safe_read_text(cfg, limit=-1)
             except OSError:
                 continue
             svc = self._infer_service_from_path(cfg, text)
@@ -758,173 +799,253 @@ class AttackSurfaceBuilder:
         return name or "unknown"
 
     def _network_callers_from_ghidra(self) -> list[EntryPoint]:
-        """从 Ghidra 产物中识别调用网络收发函数的二进制，生成 tcp_service 入口。
+        """Exact imported API evidence, never proof of TCP listening/reachability.
 
-        这覆盖自研 Web 服务器（无标准配置文件可解析）的情况：
-        只要二进制导入了 socket/bind/listen/accept/recv 之一，它就是网络入口候选。
-        数据源：
-        - ghidra/analysis_summary.json 的 analyses[].result.imports（导入符号表）
-        - ghidra/evidence.json 的证据 id（SE-GHIDRA-<slug>-<func>，兜底）
+        Previously saved candidates that lose their symbol justification remain
+        identifiable as unsupported binary candidates, with their original record.
+        Fresh non-network binaries do not become network candidates.
         """
-        entries: list[EntryPoint] = []
-        net_evidence: dict[str, list[str]] = {}
+        matches: dict[str, list[dict[str, Any]]] = {}
+        evidence: dict[str, list[str]] = {}
+        inspected: set[str] = set()
+        incomplete: set[str] = set()
+        diagnostics: list[dict[str, str]] = []
+        record_prefixes: dict[str, str] = {}
+        loaded_files = 0
 
-        # (a) imports：逐二进制扫描导入符号表
-        summary_path = self.workspace.task_dir / "ghidra" / "analysis_summary.json"
-        if summary_path.exists():
+        def diagnose(artifact: str, pointer: str, reason: str) -> None:
+            diagnostics.append({"artifact": artifact, "json_pointer": pointer, "reason": reason})
+            logger.warning("Ghidra network evidence unresolved: %s#%s: %s", artifact, pointer, reason)
+
+        def load_records(filename: str, key: str, *, allow_list: bool = False) -> list[Any] | None:
+            artifact = f"ghidra/{filename}"
+            path = self.workspace.task_dir / artifact
+            # Catch input failures only; schema checks and API matching below must
+            # not hide programming errors behind a broad exception handler.
             try:
-                summary = json.loads(summary_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                summary = {}
-            for analysis in summary.get("analyses") or []:
-                binary = str(analysis.get("binary") or "")
-                if not binary:
-                    continue
-                result = analysis.get("result") or {}
-                names = {str(i.get("name") or "").lower() for i in (result.get("imports") or []) if isinstance(i, dict)}
-                matched = sorted(nm for nm in names if any(nf == nm or nf in nm for nf in _NET_FUNCS))
-                if matched:
-                    # binary 是 rootfs 内绝对路径（/sbin/httpd），取末段做组件匹配
-                    slug = Path(binary).name
-                    ev_ids = [f"ART:ghidra-imports-{_surface_slug(slug)}"]
-                    net_evidence.setdefault(slug, []).extend(ev_ids)
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                diagnose(artifact, "", f"{type(exc).__name__}: {exc}")
+                return None
+            if isinstance(payload, dict):
+                records = payload.get(key)
+                pointer = f"/{key}"
+            elif allow_list and isinstance(payload, list):
+                records, pointer = payload, ""
+            else:
+                diagnose(artifact, "", "invalid top-level type")
+                return None
+            if not isinstance(records, list):
+                diagnose(artifact, pointer, "expected a record list")
+                return None
+            nonlocal loaded_files
+            loaded_files += 1
+            record_prefixes[artifact] = pointer
+            return records
 
-        # (b) evidence id 兜底（imports 缺失时仍可从证据记录恢复）
-        evidence_path = self.workspace.task_dir / "ghidra" / "evidence.json"
-        if evidence_path.exists():
-            try:
-                records = json.loads(evidence_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                records = []
-            if isinstance(records, dict):
-                records = records.get("evidence") or []
-            for item in records:
-                if not isinstance(item, dict):
+        summary_artifact = "ghidra/analysis_summary.json"
+        analyses = load_records("analysis_summary.json", "analyses")
+        if analyses is not None:
+            for index, analysis in enumerate(analyses):
+                pointer = f"/analyses/{index}"
+                if not isinstance(analysis, dict):
+                    diagnose(summary_artifact, pointer, "expected an analysis object")
                     continue
-                ev_id = str(item.get("id") or "")
-                binary = str((item.get("metadata") or {}).get("binary") or "")
-                if not ev_id or not binary:
+                binary = analysis.get("binary")
+                if not isinstance(binary, str) or not binary.strip() or not PurePosixPath(binary.replace("\\", "/")).name:
+                    diagnose(summary_artifact, pointer + "/binary", "expected a nonempty binary path")
                     continue
-                func = ev_id.rsplit("-", 1)[-1].lower()
-                if any(nf == func or nf in func for nf in _NET_FUNCS):
-                    net_evidence.setdefault(Path(binary).name, []).append(ev_id)
-
-        for binary_name, ev_ids in sorted(net_evidence.items()):
-            cid = self.graph.resolve_component_id(binary_name) if self.graph else None
-            entries.append(
-                EntryPoint(
-                    entry_id=f"EP-BINARY-{_surface_slug(binary_name)}",
-                    entry_type="tcp_service",
-                    name=f"{binary_name} (network syscalls)",
-                    protocol="tcp",
-                    transport="tcp",
-                    service=binary_name,
-                    component_id=cid,
-                    source="static_reference",
-                    static_or_dynamic="static",
-                    exposure_scope="local_network",
-                    runtime_confirmed=False,
-                    confidence=_NETWORK_CALLER_CONFIDENCE,
-                    evidence_ids=ev_ids,
-                )
-            )
+                name = PurePosixPath(binary.replace("\\", "/")).name
+                result = analysis.get("result")
+                if not isinstance(result, dict) or not isinstance(result.get("imports"), list):
+                    incomplete.add(name)
+                    diagnose(summary_artifact, pointer + "/result/imports", "imports unavailable or not a list")
+                    continue
+                inspected.add(name)
+                for offset, item in enumerate(result["imports"]):
+                    import_pointer = pointer + f"/result/imports/{offset}"
+                    if not isinstance(item, dict) or not isinstance(item.get("name"), str) or not item["name"]:
+                        incomplete.add(name)
+                        diagnose(summary_artifact, import_pointer, "expected an import with a nonempty symbol name")
+                        continue
+                    symbol = item["name"]
+                    api = _network_api(symbol)
+                    if api:
+                        matches.setdefault(name, []).append({
+                            "symbol": symbol, "api": api,
+                            "artifact": "ghidra/analysis_summary.json",
+                            "json_pointer": f"/analyses/{index}/result/imports/{offset}",
+                        })
+                        evidence.setdefault(name, []).append(f"ART:ghidra-imports-{_surface_slug(name)}")
+        evidence_artifact = "ghidra/evidence.json"
+        records = load_records("evidence.json", "evidence", allow_list=True)
+        if records is not None:
+            for index, item in enumerate(records):
+                pointer = record_prefixes[evidence_artifact] + f"/{index}"
+                if not isinstance(item, dict) or not isinstance(item.get("metadata"), dict):
+                    diagnose(evidence_artifact, pointer, "expected an evidence object with metadata")
+                    continue
+                metadata = item["metadata"]
+                binary = metadata.get("binary")
+                if not isinstance(binary, str) or not binary.strip() or not PurePosixPath(binary.replace("\\", "/")).name:
+                    diagnose(evidence_artifact, pointer + "/metadata/binary", "expected a nonempty binary path")
+                    continue
+                name = PurePosixPath(binary.replace("\\", "/")).name
+                # A summary ID suffix is not a symbol table. Only explicit
+                # function metadata is acceptable as fallback symbol evidence.
+                symbol = metadata.get("function") or metadata.get("symbol") or ""
+                if not isinstance(symbol, str) or not symbol:
+                    diagnose(evidence_artifact, pointer + "/metadata", "explicit symbol unavailable or not a string")
+                    continue
+                api = _network_api(symbol)
+                if api and name and name not in inspected:
+                    if not isinstance(item.get("id"), str) or not item["id"]:
+                        diagnose(evidence_artifact, pointer + "/id", "network symbol has no evidence ID")
+                        continue
+                    matches.setdefault(name, []).append({"symbol": symbol, "api": api,
+                        "artifact": "ghidra/evidence.json", "json_pointer": pointer + "/metadata"})
+                    evidence.setdefault(name, []).append(item["id"])
+        self._ghidra_input_status = {
+            "status": "complete" if not diagnostics else ("partial" if loaded_files else "unknown"),
+            "diagnostics": diagnostics,
+        }
+        previous = self.workspace.load_surface_artifact("entry_points.json") or []
+        retained = {str(item.get("service")): item for item in previous
+                    if isinstance(item, dict) and str(item.get("entry_id", "")).startswith("EP-BINARY-")
+                    and isinstance(item.get("service"), str) and item.get("service")
+                    and item.get("service") not in matches}
+        entries = []
+        for name in sorted(set(matches) | set(retained)):
+            old = retained.get(name)
+            unresolved = old is not None and (name not in inspected or name in incomplete)
+            cid = self._exact_file_component(name=name)
+            entries.append(EntryPoint(
+                entry_id=old["entry_id"] if old else f"EP-BINARY-{_surface_slug(name)}",
+                entry_type="binary_candidate" if old else "network_capability_candidate",
+                name=f"{name} (unconfirmed static candidate)", service=name,
+                component_id=cid, source="static_reference",
+                evidence_level="heuristic_only" if old else "api_symbol_observed",
+                classification_status="unconfirmed" if unresolved or not old else "unsupported",
+                confidence=0.0 if old else _NETWORK_CALLER_CONFIDENCE,
+                evidence_ids=list(old.get("evidence_ids", [])) if old else evidence.get(name, []),
+                api_matches=matches.get(name, []),
+                unresolved_reason=("Ghidra imports unavailable or incomplete; previous network capability unverified" if unresolved else
+                                   "previous network classification has no exact network API support"
+                                   if old else "socket parameters, listener relationship and runtime reachability unverified"),
+                evidence_details={"previous_entry": (old.get("evidence_details") or {}).get("previous_entry", old)} if old else {},
+            ))
         return entries
+
+    def _exact_file_component(self, *, path: str | None = None, name: str | None = None) -> str | None:
+        """Resolve file identity only; do not use global fuzzy/function lookup."""
+        components = [item for item in self.graph.components.values()
+                      if item.component_type in {"binary", "library", "script", "fastcgi"}] if self.graph else []
+        matches = [item.component_id for item in components
+                   if (path is not None and item.path == path) or
+                      (path is None and name is not None and item.name == name)]
+        return matches[0] if len(matches) == 1 else None
 
     def _web_route_entries(self, rootfs: Path) -> list[EntryPoint]:
-        """扫描 Web 目录中的 CGI 处理器与脚本，生成 http_route 入口。
-
-        P0-2：高价值 CGI/脚本入口必须解析到组件，否则污点源派生会跳过它们：
-        1. 用路径片段匹配 component_graph 中的 binary/library 组件（cgibin →
-           C-BINARY-htdocs-cgibin）；
-        2. 对脚本解析内容引用的二进制（shell 脚本调用的处理器）；
-        3. ELF 自身（magic 判定）直接作为 handler。
-        解析结果同时写入 component_id 与 handler_component_id。
-        """
-        entries: list[EntryPoint] = []
-        component_names = {item.name: item.component_id for item in self.graph.components.values()} if self.graph else {}
+        """Observe file aliases without reading them or claiming URL dispatch."""
+        entries = []
         for wd in ("htdocs", "www", "web", "usr/www", "var/www"):
             web_root = rootfs / wd
-            if not web_root.is_dir():
+            parts = PurePosixPath(wd).parts
+            if any(not is_scan_directory(rootfs.joinpath(*parts[:index])) for index in range(1, len(parts) + 1)):
                 continue
-            try:
-                for cgi in web_root.rglob("cgibin"):
-                    rel = cgi.relative_to(rootfs).as_posix()
-                    # 注意：不做 is_file() 预检——提取器产出的部分特殊 inode 在
-                    # Windows 上 stat 直接抛 WinError 1920，按路径注册入口，
-                    # 组件解析与内容嗅探全部尽力而为。
-                    component_id, handler_id = self._resolve_route_component(cgi, rel, component_names)
-                    entries.append(
-                        EntryPoint(
-                            entry_id=f"EP-CGI-{rel.replace('/', '-')}",
-                            entry_type="cgi",
-                            name=f"CGI handler: /{rel}",
-                            protocol="http",
-                            transport="tcp",
-                            path=f"/{rel}",
-                            service="http",
-                            component_id=component_id,
-                            handler_component_id=handler_id,
-                            source="static_reference",
-                            static_or_dynamic="static",
-                            exposure_scope="local_network",
-                            runtime_confirmed=False,
-                            confidence=0.7,
-                            evidence_ids=[f"ART:web-cgi-{cgi.name}"],
-                        )
-                    )
-                for pattern in ("*.cgi", "*.fcgi"):
-                    for script in web_root.rglob(pattern):
-                        rel = script.relative_to(rootfs).as_posix()
-                        component_id, handler_id = self._resolve_route_component(script, rel, component_names)
-                        entries.append(
-                            EntryPoint(
-                                entry_id=f"EP-SCRIPT-{rel.replace('/', '-')}",
-                                entry_type="http_route",
-                                name=f"CGI script: /{rel}",
-                                protocol="http",
-                                transport="tcp",
-                                path=f"/{rel}",
-                                service="http",
-                                component_id=component_id,
-                                handler_component_id=handler_id,
-                                source="static_reference",
-                                static_or_dynamic="static",
-                                exposure_scope="local_network",
-                                runtime_confirmed=False,
-                                confidence=0.5,
-                                evidence_ids=[f"ART:web-script-{script.name}"],
-                            )
-                        )
-            except OSError:
-                continue
-        return entries
+            # os.walk does not traverse firmware directory links or reparse points.
+            for current, dirs, files in os.walk(web_root, followlinks=False):
+                current = Path(current)
+                dirs[:] = [name for name in dirs if is_scan_directory(current / name)]
+                for name in files:
+                    is_handler = name == "cgibin"
+                    if not is_handler and not name.endswith((".cgi", ".fcgi")):
+                        continue
+                    script = current / name
+                    rel = script.relative_to(rootfs).as_posix()
+                    facts = self._route_file_facts(script, rootfs)
+                    observed = facts["file_kind"] in {"regular", "symlink"}
+                    cid = self._exact_file_component(path="/" + rel) if facts["file_kind"] == "regular" else None
+                    candidate_handler = self._exact_file_component(path=facts["candidate_file_entity"]) if observed else None
+                    entries.append(EntryPoint(
+                        entry_id=f"EP-{'CGI' if is_handler else 'SCRIPT'}-{rel.replace('/', '-')}",
+                        entry_type="cgi" if is_handler else "http_route",
+                        name=f"CGI file candidate: /{rel}", path=f"/{rel}",
+                        filesystem_path=f"/{rel}", url_path=None,
+                        symlink_target=facts["symlink_target"],
+                        candidate_file_entity=facts["candidate_file_entity"],
+                        candidate_handler_component_id=candidate_handler,
+                        component_id=cid, handler_component_id=cid,
+                        source="static_reference", evidence_level="file_or_symlink_observed" if observed else "heuristic_only",
+                        confidence=0.7 if is_handler else 0.5,
+                        unresolved_reason=facts["error"] or "URL mapping and handler dispatch unconfirmed",
+                        evidence_ids=[f"ART:web-{'cgi' if is_handler else 'script'}-{name}"],
+                        evidence_details={"file_kind": facts["file_kind"], "path_semantics": "rootfs_file"},
+                    ))
+        return _unique_entries(entries)
+
+    @staticmethod
+    def _route_file_facts(path: Path, rootfs: Path) -> dict[str, Any]:
+        """Metadata only; firmware absolute links are rooted inside rootfs.
+
+        Do not resolve links with host semantics or traverse a reparse point.
+        A target path is a candidate file entity, never a proven dispatcher.
+        """
+        result = {"file_kind": "unknown", "symlink_target": None,
+                  "candidate_file_entity": None, "error": None}
+        try:
+            info = path.lstat()
+            if getattr(info, "st_file_attributes", 0) & 0x400:
+                result["file_kind"] = "reparse_point"
+                result["error"] = "Windows reparse target unverified"
+            elif stat.S_ISLNK(info.st_mode):
+                result["file_kind"] = "symlink"
+                target = os.readlink(path)
+                result["symlink_target"] = target
+                if "\\" in target or ":" in target:
+                    result["error"] = "non-POSIX firmware link target unverified"
+                    return result
+                base = PurePosixPath("/") if target.startswith("/") else PurePosixPath("/" + path.parent.relative_to(rootfs).as_posix())
+                parts: list[str] = []
+                for part in (base / target).parts:
+                    if part in {"/", "."}:
+                        continue
+                    if part == "..":
+                        if not parts:
+                            result["error"] = "link escapes rootfs"
+                            return result
+                        parts.pop()
+                    else:
+                        parts.append(part)
+                # Reject linked/reparse parent directories and non-regular final
+                # targets. No content open and no recursive symlink following.
+                candidate = rootfs
+                for part in parts[:-1]:
+                    candidate /= part
+                    if not is_scan_directory(candidate):
+                        result["error"] = "linked or unavailable target parent"
+                        return result
+                target_info = (rootfs.joinpath(*parts)).lstat()
+                if stat.S_ISREG(target_info.st_mode) and not getattr(target_info, "st_file_attributes", 0) & 0x400:
+                    result["candidate_file_entity"] = "/" + "/".join(parts)
+                else:
+                    result["error"] = "target is not an observed ordinary file"
+            elif stat.S_ISREG(info.st_mode):
+                result["file_kind"] = "regular"
+                result["candidate_file_entity"] = "/" + path.relative_to(rootfs).as_posix()
+            else:
+                result["file_kind"] = "special"
+                result["error"] = "special file metadata only; content not read"
+        except OSError as exc:
+            result["error"] = f"metadata unavailable: {type(exc).__name__}: {exc}"
+        return result
 
     def _resolve_route_component(
         self, script_path: Path, rel_path: str, component_names: dict[str, str]
     ) -> tuple[str | None, str | None]:
-        """为 CGI/脚本入口解析 component 与 handler（P0-2 策略 1/2/3）。
-
-        返回 (component_id, handler_component_id)，解析失败时为 (None, None)。
-        """
-        # 策略 1：路径片段匹配组件的 name 或 path（如 htdocs/cgibin → cgibin 组件）
-        for token in (Path(rel_path).stem, Path(rel_path).name, "/".join(Path(rel_path).parts[-2:])):
-            cid = self.graph.resolve_component_id(token) if self.graph else None
-            if cid:
-                return cid, cid
-        try:
-            head = script_path.read_bytes()[:8192]
-        except OSError:
-            return None, None
-        # 策略 3：脚本本身是 ELF → 自身即为 handler 组件
-        if head[:4] == b"\x7fELF":
-            cid = self.graph.resolve_component_id(script_path.stem) if self.graph else None
-            return cid, cid
-        # 策略 2：文本脚本（shell/lua）内容中引用的二进制名 → handler 指向该组件
-        text = head.decode("utf-8", errors="ignore").lower()
-        for name, cid in component_names.items():
-            if name and name.lower() in text:
-                return cid, cid
-        return None, None
+        """Compatibility helper: exact file identity, never function-name containment."""
+        cid = self._exact_file_component(path="/" + rel_path.lstrip("/"))
+        return cid, cid
 
     def _discover_routes(self, entries: list[EntryPoint]) -> list[RouteMapping]:
         routes: list[RouteMapping] = []
@@ -975,7 +1096,8 @@ class AttackSurfaceBuilder:
     def _describe_inputs(self, entries: list[EntryPoint]) -> list[InputSource]:
         inputs = []
         for entry in entries:
-            network_exposed = entry.exposure_scope in {"external_network", "local_network", "loopback"}
+            network_exposed = (None if entry.exposure_scope == "unknown" else
+                               entry.exposure_scope in {"external_network", "local_network", "loopback"})
             inputs.append(
                 InputSource(
                     input_id=f"IN-{entry.entry_id}",
@@ -1008,6 +1130,11 @@ class AttackSurfaceBuilder:
                 relationship_ids.update(path.get("relationship_ids", []))
             state = "runtime_confirmed" if entry.runtime_confirmed else "statically_reachable"
             blocking = None
+            if not entry.runtime_confirmed and entry.evidence_level in {
+                "file_or_symlink_observed", "api_symbol_observed", "heuristic_only"
+            }:
+                state = "candidate"
+                blocking = "file/symbol evidence identifies a candidate component; external entry reachability unconfirmed"
             if entry.entry_type == "stdin" and entry.exposure_scope == "local_process":
                 state = "blocked"
                 blocking = "local process stdin entry is not firmware external network exposure"
@@ -1138,6 +1265,8 @@ class AttackSurfaceBuilder:
     ) -> AttackSurfaceSummary:
         network_scopes = {"external_network", "local_network", "loopback"}
         return AttackSurfaceSummary(
+            **{key: value for key, value in surface_counts(entries=[item.to_dict() for item in entries], routes=routes).items()
+               if key not in {"count_status", "count_disagreements", "runtime_confirmed_entries"}},
             total_entries=len(entries),
             runtime_confirmed_entries=sum(1 for entry in entries if entry.runtime_confirmed),
             network_entries=sum(1 for entry in entries if entry.exposure_scope in network_scopes),
@@ -1156,6 +1285,9 @@ class AttackSurfaceBuilder:
                 "HTTP 500 != VULNERABILITY",
                 "LISTENING PORT != SECURITY BUG",
                 "0.0.0.0 or an unspecified bind address does not imply public internet exposure",
+                "Static file/API candidates do not establish URLs, TCP listening, authentication or runtime reachability",
+                "Legacy local_entries includes unknown exposure scopes; it does not prove local-only reachability",
+                "Confidence is a rule score, not a probability of reachability or vulnerability",
             ],
         )
 
@@ -1338,6 +1470,8 @@ def _surface_slug(value: str) -> str:
 
 
 def _input_description(entry: EntryPoint) -> str:
+    if entry.filesystem_path and entry.url_path is None:
+        return f"file candidate at {entry.filesystem_path}; URL mapping and handler dispatch unconfirmed"
     if entry.entry_type in {"http_route", "https_route"}:
         method = entry.method or "method unknown"
         return f"{entry.protocol or 'http'} {entry.path or ''} on TCP {entry.port or 'unknown'} ({method})"

@@ -4,7 +4,7 @@
     uvicorn web.server.main:app --reload --port 8000
 
 生产：
-    uvicorn web.server.main:app --host 0.0.0.0 --port 8000 --workers 1
+    uvicorn web.server.main:app --host 127.0.0.1 --port 8000 --workers 1
     注意：SSE、asyncio 任务队列都基于进程内状态，请保持 --workers 1，
     多 worker 部署需把任务队列与事件分发移到 Redis 等外部组件。
 """
@@ -13,22 +13,26 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import mimetypes
 import shutil
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import quote
 
-from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
 from sse_starlette.sse import EventSourceResponse
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
+from fwagent.tools.bounded_io import read_beneath
 
 from . import config, security, tasks
 from .database import SessionLocal, get_db, init_db
-from .models import AppConfig, Task
+from .models import AppConfig, Task, TaskCredential
+from .task_config import is_current_snapshot, validate_endpoint
 from .schemas import (
     AnalyzeResponse,
     ArtifactInfo,
@@ -45,6 +49,20 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 logger = logging.getLogger("firmxplore.web")
 
 app = FastAPI(title="FirmXplore Console", version="0.1.0")
+
+
+@app.middleware("http")
+async def authenticate_web(request: Request, call_next):
+    # Protect static pages too: a browser establishes Basic auth before fetching
+    # APIs, EventSource streams or direct downloads. No token in URLs/cookies.
+    if request.method != "OPTIONS":
+        try:
+            security.require_principal(request)
+        except HTTPException as exc:
+            return JSONResponse({"detail": exc.detail}, status_code=exc.status_code, headers=exc.headers)
+    response = await call_next(request)
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 app.add_middleware(
     CORSMiddleware,
@@ -68,8 +86,10 @@ async def startup() -> None:
     # 上次服务退出时可能遗留 running/pending 记录（子进程已死），标记为失败
     db: Session = SessionLocal()
     try:
-        orphans = db.scalars(select(Task).where(Task.status.in_(["running", "pending"]))).all()
+        orphans = db.scalars(select(Task).where(Task.owner_id.is_not(None), Task.status.in_(["running", "pending"]))).all()
         for task in orphans:
+            if not is_current_snapshot(task.config_json):
+                continue
             task.status = "failed"
             task.error = "服务重启导致任务中断，请重新提交"
         db.commit()
@@ -88,8 +108,10 @@ async def startup() -> None:
 _CONFIG_KEYS = ("model_provider", "model_name", "base_url", "deterministic")
 
 
-def _load_config(db: Session) -> dict:
-    rows = {row.key: row.value for row in db.scalars(select(AppConfig))}
+def _load_config(db: Session, principal: str) -> dict:
+    prefix = principal + ":"
+    keys = [prefix + name for name in (*_CONFIG_KEYS, "api_key")]
+    rows = {row.key[len(prefix):]: row.value for row in db.scalars(select(AppConfig).where(AppConfig.key.in_(keys)))}
     api_key = security.decrypt(rows["api_key"]) if rows.get("api_key") else None
     cfg = {key: rows.get(key, "") for key in _CONFIG_KEYS}
     cfg["deterministic"] = cfg["deterministic"] in ("1", "true", "True", "")
@@ -100,7 +122,7 @@ def _load_config(db: Session) -> dict:
 
 
 @app.post("/api/config")
-def save_config(body: ConfigUpdate, db: Session = Depends(get_db)) -> ConfigStatus:
+def save_config(body: ConfigUpdate, db: Session = Depends(get_db), principal: str = Depends(security.require_principal)) -> ConfigStatus:
     """保存 provider 配置。api_key 为 None 表示保留旧值；空字符串表示清除。"""
     values: dict[str, str] = {
         "model_provider": "deterministic" if body.deterministic else body.model_provider,
@@ -110,16 +132,24 @@ def save_config(body: ConfigUpdate, db: Session = Depends(get_db)) -> ConfigStat
     }
     if not body.deterministic and not body.model_provider:
         raise HTTPException(400, "非确定性模式必须填写 model_provider")
+    try:
+        validate_endpoint(body.base_url)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from None
+    previous = _load_config(db, principal)
+    if previous.get("api_key") and body.base_url != previous["base_url"] and body.api_key is None:
+        raise HTTPException(400, "Changing the model endpoint requires explicitly replacing or clearing its key")
     if body.api_key is not None:
         values["api_key"] = security.encrypt(body.api_key) if body.api_key else ""
     for key, value in values.items():
-        row = db.get(AppConfig, key)
+        scoped_key = principal + ":" + key
+        row = db.get(AppConfig, scoped_key)
         if row is None:
-            db.add(AppConfig(key=key, value=value))
+            db.add(AppConfig(key=scoped_key, value=value))
         else:
             row.value = value
     db.commit()
-    return _config_status(_load_config(db))
+    return _config_status(_load_config(db, principal))
 
 
 def _config_status(cfg: dict) -> ConfigStatus:
@@ -133,9 +163,9 @@ def _config_status(cfg: dict) -> ConfigStatus:
 
 
 @app.get("/api/config")
-def get_config(db: Session = Depends(get_db)) -> ConfigStatus:
+def get_config(db: Session = Depends(get_db), principal: str = Depends(security.require_principal)) -> ConfigStatus:
     """配置状态：绝不返回 API Key 明文。"""
-    return _config_status(_load_config(db))
+    return _config_status(_load_config(db, principal))
 
 
 # ---------------------------------------------------------------------------
@@ -150,7 +180,7 @@ async def start_analysis(
     no_dynamic: bool = Form(False),
     timeout: int = Form(600),
     use_saved_config: bool = Form(True),
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_db), principal: str = Depends(security.require_principal),
 ) -> AnalyzeResponse:
     """上传固件并立即返回 task_id，分析在后台执行。"""
     if file.filename is None or not Path(file.filename).suffix.lower() in config.ALLOWED_EXTENSIONS:
@@ -178,14 +208,15 @@ async def start_analysis(
 
     # 配置快照（剔除 API Key），任务详情页据此展示用户当时的选择
     if use_saved_config:
-        saved = _load_config(db)
+        saved = _load_config(db, principal)
         cfg = {k: saved.get(k) for k in ("model_provider", "model_name", "base_url", "deterministic")}
-        cfg["api_key"] = saved.get("api_key")
+        api_key = saved.get("api_key") if not cfg["deterministic"] else None
     else:
-        cfg = {"model_provider": "deterministic", "model_name": "", "base_url": "", "deterministic": True, "api_key": None}
+        cfg = {"model_provider": "deterministic", "model_name": "", "base_url": "", "deterministic": True}
+        api_key = None
     cfg["options"] = {"static_only": static_only, "fast": fast, "no_dynamic": no_dynamic, "timeout": timeout}
 
-    task_id = tasks.create_task_row(file.filename, upload_path, cfg, size)
+    task_id = tasks.create_task_row(file.filename, upload_path, cfg, size, owner_id=principal, api_key=api_key)
     # 并发闸门包裹实际的执行协程；_execute 是任务真正排队启动的地方
     asyncio.create_task(_execute(task_id))
     return AnalyzeResponse(task_id=task_id)
@@ -206,31 +237,36 @@ async def _execute(task_id: str, *, resume: bool = False) -> None:
 # ---------------------------------------------------------------------------
 
 @app.get("/api/tasks")
-def list_tasks(status: str | None = None, db: Session = Depends(get_db)) -> list[TaskOut]:
-    query = select(Task).order_by(Task.created_at.desc())
+def list_tasks(status: str | None = None, db: Session = Depends(get_db), principal: str = Depends(security.require_principal)) -> list[TaskOut]:
+    query = select(Task).where(Task.owner_id == principal).order_by(Task.created_at.desc())
     if status:
         query = query.where(Task.status == status)
-    return [TaskOut.model_validate(t) for t in db.scalars(query)]
+    return [TaskOut.model_validate(t) for t in db.scalars(query) if is_current_snapshot(t.config_json)]
 
 
-def _get_task_or_404(db: Session, task_id: str) -> Task:
+def _get_task_or_404(db: Session, task_id: str, principal: str) -> Task:
     task = db.get(Task, task_id)
-    if task is None:
+    if task is None or task.owner_id != principal:
         raise HTTPException(404, "任务不存在")
+    if not is_current_snapshot(task.config_json):
+        raise HTTPException(409, "Legacy/private task snapshot is quarantined; create a new task with current credentials")
     return task
 
 
 @app.get("/api/tasks/{task_id}")
-def get_task(task_id: str, db: Session = Depends(get_db)) -> TaskOut:
-    return TaskOut.model_validate(_get_task_or_404(db, task_id))
+def get_task(task_id: str, db: Session = Depends(get_db), principal: str = Depends(security.require_principal)) -> TaskOut:
+    return TaskOut.model_validate(_get_task_or_404(db, task_id, principal))
 
 
 @app.delete("/api/tasks/{task_id}")
-def delete_task(task_id: str, db: Session = Depends(get_db)) -> dict:
-    task = _get_task_or_404(db, task_id)
+def delete_task(task_id: str, db: Session = Depends(get_db), principal: str = Depends(security.require_principal)) -> dict:
+    task = _get_task_or_404(db, task_id, principal)
     if task.status in ("pending", "running") or tasks.is_running(task_id):
         raise HTTPException(409, "任务正在运行，请先暂停再删除")
     tasks.delete_task_files(task)
+    credential = db.get(TaskCredential, task_id)
+    if credential is not None:
+        db.delete(credential)
     db.delete(task)
     db.commit()
     return {"deleted": task_id}
@@ -241,18 +277,18 @@ def delete_task(task_id: str, db: Session = Depends(get_db)) -> dict:
 # ---------------------------------------------------------------------------
 
 @app.post("/api/tasks/{task_id}/stop")
-def stop_task(task_id: str, db: Session = Depends(get_db)) -> dict:
+def stop_task(task_id: str, db: Session = Depends(get_db), principal: str = Depends(security.require_principal)) -> dict:
     """暂停任务：终止分析子进程，保留工作区，之后可通过 /resume 续跑。"""
-    _get_task_or_404(db, task_id)
+    _get_task_or_404(db, task_id, principal)
     if not tasks.stop_analysis(task_id):
         raise HTTPException(409, "任务当前没有在运行的进程")
     return {"stopped": task_id}
 
 
 @app.post("/api/tasks/{task_id}/resume")
-async def resume_task(task_id: str, db: Session = Depends(get_db)):
+async def resume_task(task_id: str, db: Session = Depends(get_db), principal: str = Depends(security.require_principal)):
     """恢复已暂停的任务：用 fwagent 的 analyze(resume=True) 在子进程中续跑。"""
-    task = _get_task_or_404(db, task_id)
+    task = _get_task_or_404(db, task_id, principal)
     if task.status != "paused":
         raise HTTPException(409, f"仅已暂停的任务可以恢复（当前：{task.status}）")
     if tasks.is_running(task_id):
@@ -268,12 +304,12 @@ async def resume_task(task_id: str, db: Session = Depends(get_db)):
 # ---------------------------------------------------------------------------
 
 @app.get("/api/tasks/{task_id}/stream")
-async def stream_task(task_id: str, db: Session = Depends(get_db)):
+async def stream_task(task_id: str, db: Session = Depends(get_db), principal: str = Depends(security.require_principal)):
     """SSE 流：先推送一次当前全量快照，之后转发 EventHub 的增量事件。
 
     watcher 每 2s 才轮询一次，订阅后立即发快照可让前端秒级渲染首帧。
     """
-    task = _get_task_or_404(db, task_id)
+    task = _get_task_or_404(db, task_id, principal)
     queue = tasks.event_hub.subscribe(task_id)
 
     async def generator():
@@ -305,23 +341,22 @@ _REPORT_FILES = {"json": "report.json", "md": "report.md", "html": "report.html"
 
 
 @app.get("/api/tasks/{task_id}/report")
-def get_report(task_id: str, format: str = "json", db: Session = Depends(get_db)):
+def get_report(task_id: str, format: str = "json", db: Session = Depends(get_db), principal: str = Depends(security.require_principal)):
     """返回报告内容。json 解析后返回结构化 JSON；md 返回纯文本；html 以附件下载。"""
     if format not in _REPORT_FILES:
         raise HTTPException(400, "format 仅支持 json|md|html")
-    task = _get_task_or_404(db, task_id)
-    report_file = config.WORKSPACE_ROOT / task_id / "reports" / _REPORT_FILES[format]
-    if not report_file.exists():
-        raise HTTPException(404, f"报告尚未生成（任务状态：{task.status}）")
+    task = _get_task_or_404(db, task_id, principal)
+    relative = "reports/" + _REPORT_FILES[format]
+    data = _public_artifact_bytes(task_id, relative)
     if format == "json":
         try:
-            return JSONResponse(json.loads(report_file.read_text(encoding="utf-8")))
+            return JSONResponse(json.loads(data))
         except json.JSONDecodeError:
             raise HTTPException(500, "JSON 报告解析失败")
     if format == "md":
-        return PlainTextResponse(report_file.read_text(encoding="utf-8"), media_type="text/markdown; charset=utf-8")
+        return PlainTextResponse(data.decode("utf-8"), media_type="text/markdown; charset=utf-8")
     # HTML 以附件方式下载，避免在主站域内执行报告中的任意脚本
-    return FileResponse(report_file, media_type="text/html", filename=f"{task.filename}.report.html")
+    return _attachment(data, f"{task.filename}.report.html", "text/html")
 
 
 # ---------------------------------------------------------------------------
@@ -332,18 +367,63 @@ MAX_ARTIFACTS = 2000
 # 产物列表中跳过的中间目录（体积大且对用户无意义）
 _SKIPPED_DIRS = {"extracted"}
 
+# A closed export surface: never offer input, logs, spec, environment, private
+# configuration or arbitrary files from a task directory for download.
+PUBLIC_ARTIFACTS = {
+    "reports/report.json", "reports/report.md", "reports/report.html", "reports/analysis.json",
+    "pipeline_stages.json", "artifacts/extraction.json", "artifacts/rootfs.json",
+    "correlation/component_graph.json", "correlation/summary.json",
+    "surface/entry_points.json", "surface/attack_surface_summary.json", "surface/routes.json",
+    "taint/summary.json", "taint/taint_paths.json", "findings/findings.json",
+}
+
+
+def _public_artifact_path(task_id: str, relative: str) -> Path:
+    if relative not in PUBLIC_ARTIFACTS:
+        raise HTTPException(403, "This file is not a public task artifact")
+    task_dir = config.WORKSPACE_ROOT / task_id
+    current = task_dir
+    for part in ("", *relative.split("/")):
+        if part:
+            current /= part
+        try:
+            info = current.lstat()
+        except FileNotFoundError:
+            raise HTTPException(404, "产物尚未生成") from None
+        if current.is_symlink() or getattr(info, "st_file_attributes", 0) & 0x400:
+            raise HTTPException(403, "Linked task artifacts are not public")
+    if not current.resolve().is_relative_to(task_dir.resolve()) or not current.is_file():
+        raise HTTPException(404, "文件不存在")
+    return current
+
+
+def _public_artifact_bytes(task_id: str, relative: str) -> bytes:
+    _public_artifact_path(task_id, relative)
+    try:return read_beneath(config.WORKSPACE_ROOT / task_id, relative, limit=16*1024*1024)
+    except FileNotFoundError:raise HTTPException(404, "产物尚未生成") from None
+    except (OSError, ValueError):raise HTTPException(403, "Artifact is linked, changed or exceeds the export budget") from None
+
+
+def _attachment(data: bytes, filename: str, media_type: str | None = None):
+    return Response(data, media_type=media_type or "application/octet-stream", headers={
+        "Content-Disposition": "attachment; filename*=utf-8''" + quote(filename, safe=""),
+        "X-Content-Type-Options": "nosniff",
+    })
+
 
 @app.get("/api/tasks/{task_id}/artifacts")
-def list_artifacts(task_id: str, db: Session = Depends(get_db)) -> ArtifactListResponse:
-    _get_task_or_404(db, task_id)
+def list_artifacts(task_id: str, db: Session = Depends(get_db), principal: str = Depends(security.require_principal)) -> ArtifactListResponse:
+    _get_task_or_404(db, task_id, principal)
     task_dir = config.WORKSPACE_ROOT / task_id
     if not task_dir.is_dir():
         return ArtifactListResponse(task_id=task_id, artifacts=[], truncated=False)
 
     artifacts: list[ArtifactInfo] = []
     truncated = False
-    for path in sorted(task_dir.rglob("*")):
-        if not path.is_file():
+    for relative in sorted(PUBLIC_ARTIFACTS):
+        try:
+            path = _public_artifact_path(task_id, relative)
+        except HTTPException:
             continue
         rel = path.relative_to(task_dir).as_posix()
         if any(part in _SKIPPED_DIRS for part in path.relative_to(task_dir).parts):
@@ -360,16 +440,10 @@ def list_artifacts(task_id: str, db: Session = Depends(get_db)) -> ArtifactListR
 
 
 @app.get("/api/tasks/{task_id}/artifacts/{artifact_path:path}")
-def download_artifact(task_id: str, artifact_path: str, db: Session = Depends(get_db)):
+def download_artifact(task_id: str, artifact_path: str, db: Session = Depends(get_db), principal: str = Depends(security.require_principal)):
     """下载产物文件。路径拼接后必须仍位于任务目录内（防目录穿越）。"""
-    _get_task_or_404(db, task_id)
-    task_dir = (config.WORKSPACE_ROOT / task_id).resolve()
-    target = (task_dir / artifact_path).resolve()
-    if not str(target).startswith(str(task_dir)):
-        raise HTTPException(400, "非法路径")
-    if not target.is_file():
-        raise HTTPException(404, "文件不存在")
-    return FileResponse(target, filename=target.name)
+    _get_task_or_404(db, task_id, principal)
+    return _attachment(_public_artifact_bytes(task_id, artifact_path), Path(artifact_path).name)
 
 
 # ---------------------------------------------------------------------------
@@ -377,19 +451,19 @@ def download_artifact(task_id: str, artifact_path: str, db: Session = Depends(ge
 # ---------------------------------------------------------------------------
 
 @app.get("/api/tasks/{task_id}/graph")
-def get_graph(task_id: str, db: Session = Depends(get_db)) -> GraphResponse:
+def get_graph(task_id: str, db: Session = Depends(get_db), principal: str = Depends(security.require_principal)) -> GraphResponse:
     """返回组件关联图（correlation 阶段产物）。
 
     数据源：workspace/{task_id}/correlation/component_graph.json，
     由 fwagent 的 ComponentGraphBuilder 生成；未生成时返回 404，
     前端据此显示"拓扑图尚未生成"。
     """
-    _get_task_or_404(db, task_id)
-    graph_file = config.WORKSPACE_ROOT / task_id / "correlation" / "component_graph.json"
+    _get_task_or_404(db, task_id, principal)
+    graph_file = _public_artifact_path(task_id, "correlation/component_graph.json")
     if not graph_file.exists():
         raise HTTPException(404, "拓扑图尚未生成（关联分析阶段完成后可用）")
     try:
-        data = json.loads(graph_file.read_text(encoding="utf-8"))
+        data = json.loads(_public_artifact_bytes(task_id, "correlation/component_graph.json"))
     except (OSError, json.JSONDecodeError):
         raise HTTPException(500, "拓扑图数据解析失败")
 
@@ -420,25 +494,25 @@ def get_graph(task_id: str, db: Session = Depends(get_db)) -> GraphResponse:
     summary_file = config.WORKSPACE_ROOT / task_id / "correlation" / "summary.json"
     if summary_file.exists():
         try:
-            summary = json.loads(summary_file.read_text(encoding="utf-8"))
+            summary = json.loads(_public_artifact_bytes(task_id, "correlation/summary.json"))
         except (OSError, json.JSONDecodeError):
             pass
     return GraphResponse(task_id=task_id, nodes=nodes, edges=edges, summary=summary)
 
 
 @app.get("/api/tasks/{task_id}/model-usage")
-def get_model_usage(task_id: str, db: Session = Depends(get_db)) -> dict:
+def get_model_usage(task_id: str, db: Session = Depends(get_db), principal: str = Depends(security.require_principal)) -> dict:
     """模型调用的 token 消耗记录（web_model_usage.jsonl，由 ModelProvider 追加）。
 
     用于核对 DeepSeek 后台额度：每行是一次 model.chat 的 usage 快照。
     """
-    _get_task_or_404(db, task_id)
+    _get_task_or_404(db, task_id, principal)
     usage_file = config.WORKSPACE_ROOT / task_id / "web_model_usage.jsonl"
     if not usage_file.exists():
         return {"task_id": task_id, "calls": [], "totals": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "calls": 0}}
     calls = []
     try:
-        for line in usage_file.read_text(encoding="utf-8").splitlines():
+        for line in read_beneath(config.WORKSPACE_ROOT / task_id, "web_model_usage.jsonl", limit=8*1024*1024).decode("utf-8").splitlines():
             if line.strip():
                 calls.append(json.loads(line))
     except (OSError, json.JSONDecodeError):
@@ -466,10 +540,16 @@ async def _cleanup_loop() -> None:
             try:
                 stale = db.scalars(select(Task).where(
                     Task.created_at < cutoff,
+                    Task.owner_id.is_not(None),
                     Task.status.in_(["success", "failed"]),
                 )).all()
                 for task in stale:
+                    if not is_current_snapshot(task.config_json):
+                        continue
                     tasks.delete_task_files(task)
+                    credential = db.get(TaskCredential, task.id)
+                    if credential is not None:
+                        db.delete(credential)
                     db.delete(task)
                 db.commit()
                 if stale:
@@ -493,7 +573,12 @@ if _frontend_dist.is_dir():
 
     @app.get("/{full_path:path}", include_in_schema=False)
     async def spa_fallback(full_path: str):
-        target = (_frontend_dist / full_path).resolve()
-        if full_path and target.is_file() and str(target).startswith(str(_frontend_dist.resolve())):
-            return FileResponse(target)
-        return FileResponse(_frontend_dist / "index.html")
+        try:
+            data = read_beneath(_frontend_dist, full_path or "index.html", limit=16*1024*1024)
+            media_type = mimetypes.guess_type(full_path or "index.html")[0]
+        except FileNotFoundError:
+            data = read_beneath(_frontend_dist, "index.html", limit=16*1024*1024)
+            media_type = "text/html"
+        except (OSError, ValueError):
+            raise HTTPException(403, "Static path is outside the frontend root or cannot be read safely") from None
+        return Response(data, media_type=media_type, headers={"X-Content-Type-Options": "nosniff"})

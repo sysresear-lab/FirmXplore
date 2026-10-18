@@ -13,7 +13,7 @@ spec.json 结构：
   "workspace": "...",
   "log_path": "...",
   "resume": false,
-  "cfg": {"model_provider": ..., "api_key": ..., ...},
+  "cfg": {"model_provider": ..., ...},
   "options": {"static_only": false, "fast": false, "no_dynamic": false, "timeout": 600}
 }
 """
@@ -27,6 +27,9 @@ from pathlib import Path
 
 def _apply_model_config(cfg: dict) -> None:
     """与主进程 tasks._apply_model_config 相同的约定：fwagent 读 MODEL_* 环境变量。"""
+    for name in ("MODEL_PROVIDER", "MODEL_NAME", "MODEL_BASE_URL", "MODEL_API_KEY",
+                 "FWAGENT_MODEL_PROVIDER", "FWAGENT_MODEL_NAME", "FWAGENT_MODEL_BASE_URL", "FWAGENT_MODEL_API_KEY"):
+        os.environ.pop(name, None)
     if cfg.get("deterministic") or cfg.get("model_provider") in ("", "deterministic"):
         os.environ["MODEL_PROVIDER"] = "deterministic"
         os.environ.pop("MODEL_API_KEY", None)
@@ -40,15 +43,45 @@ def _apply_model_config(cfg: dict) -> None:
         os.environ["MODEL_API_KEY"] = cfg["api_key"]
 
 
+def _read_private_key(stream) -> str:
+    raw = stream.readline(4097)
+    if len(raw) > 4096:
+        raise ValueError("invalid runner credential handoff")
+    try:
+        value = json.loads(raw)
+        key = value["api_key"]
+        if set(value) != {"api_key"} or not isinstance(key, str) or len(key) > 512:
+            raise ValueError
+        return key
+    except (ValueError, TypeError, KeyError):
+        raise ValueError("invalid runner credential handoff") from None
+
+
+class _RedactedLog:
+    def __init__(self, handle, secret: str):
+        self.handle, self.secret = handle, secret
+
+    def write(self, text):
+        return self.handle.write(text.replace(self.secret, "[REDACTED]") if self.secret else text)
+
+    def flush(self):
+        self.handle.flush()
+
+
 def main() -> None:
     spec_path = Path(sys.argv[1])
     spec = json.loads(spec_path.read_text(encoding="utf-8"))
+    from .task_config import validate_task_config
+    spec["cfg"] = validate_task_config({**spec["cfg"], "options": spec.get("options") or {}})
+    api_key = _read_private_key(sys.stdin)
+    # Only this in-memory copy carries a private field.
+    spec["cfg"]["api_key"] = api_key
 
     log_path = Path(spec["log_path"])
     # stdout/stderr 全部进日志文件：进度行、警告、异常堆栈都会实时出现在前端日志面板
     log_handle = log_path.open("w", encoding="utf-8", buffering=1)  # 行缓冲
-    sys.stdout = log_handle
-    sys.stderr = log_handle
+    sys.stdout = _RedactedLog(log_handle, api_key)
+    sys.stderr = sys.stdout
     os.dup2(log_handle.fileno(), 1)
     os.dup2(log_handle.fileno(), 2)
 
@@ -92,6 +125,19 @@ def _model_ready(cfg: dict) -> bool:
     if cfg.get("deterministic") or cfg.get("model_provider") in ("", "deterministic"):
         return False
     return all(str(cfg.get(k) or "").strip() for k in ("model_provider", "model_name", "api_key", "base_url"))
+
+
+def _private_model_config(cfg: dict):
+    """A Web task has one credential authority; never consult shared files/env."""
+    from fwagent.model.config import ModelConfig
+    from .task_config import validate_endpoint
+    if not _model_ready(cfg):
+        raise ValueError("task model credentials are incomplete")
+    validate_endpoint(cfg["base_url"])
+    result = ModelConfig(provider=cfg["model_provider"], model=cfg["model_name"],
+                         api_key=cfg["api_key"], base_url=cfg["base_url"])
+    result.require_credentials()
+    return result
 
 
 def _remap_to_current_env(path_str: str, workspace_root: str) -> str | None:
@@ -163,13 +209,15 @@ def _run_model_investigation(spec: dict) -> None:
     task_dir = Path(spec["workspace"]) / spec["task_id"]
     try:
         from fwagent.investigation.agent import PiAgent
-        from fwagent.model.config import load_model_config
         from fwagent.model.provider import ModelProvider
+        from fwagent.model.redaction import redact_value
 
-        # load_model_config 读取本进程环境变量（_apply_model_config 已注入）
-        model_config = load_model_config()
-        model_config.require_credentials()
-        provider = ModelProvider(model_config, timeout=60, usage_log_path=task_dir / "web_model_usage.jsonl")
+        class PrivateModelProvider(ModelProvider):
+            def chat(self, *args, **kwargs):
+                return redact_value(super().chat(*args, **kwargs), [self.config.api_key])
+
+        model_config = _private_model_config(cfg)
+        provider = PrivateModelProvider(model_config, timeout=60, usage_log_path=task_dir / "web_model_usage.jsonl")
         model_info = {"provider": model_config.provider, "model": model_config.model}
 
         def _build(require_ghidra: bool) -> PiAgent:

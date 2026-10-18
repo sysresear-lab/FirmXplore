@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import time
 from collections import defaultdict
@@ -10,6 +11,7 @@ from typing import Any, Callable
 
 from fwagent.config import Round2Config, load_round2_config
 from fwagent.model.config import CONFIGURED_MESSAGE, ModelConfig, ModelConfigError
+from fwagent.model.provider import ModelProvider
 from fwagent.models import Evidence, Hypothesis
 from fwagent.tools.ghidra_api import BinaryToolAPI, DANGEROUS_NAMES
 
@@ -347,9 +349,14 @@ class PiAgent:
         )
         self.tools = self._build_tools()
         self.evidence: list[Evidence] = []
+        self._trusted_evidence: dict[str, str] = {}
         self.hypotheses: list[Hypothesis] = []
         self.tool_trace: list[dict[str, Any]] = []
         self.steps = 0
+        self.model_calls = 0
+        self.budget_used = 0
+        self.parse_errors = 0
+        self.model_trace: list[dict[str, Any]] = []
         self.stop_reason = "completed"
         self.model_error: str | None = None
         self.report: dict[str, Any] | None = None
@@ -462,10 +469,24 @@ class PiAgent:
         # 记入 model_errors 并继续下一轮；连续 max_consecutive_model_failures
         # 次失败才判定 model_error 终止。
         consecutive_failures = 0
-        while self.steps < self.max_steps:
+        while self.budget_used < self.max_steps:
+            remaining = self.max_steps - self.budget_used
+            self.model_calls += 1
+            self.budget_used += 1
+            request = {"call": self.model_calls, "budget_used": self.budget_used, "request_attempts": 1, "status": "running"}
+            self.model_trace.append(request)
             try:
-                response = self.model.chat(messages, max_tokens=800)
+                if isinstance(self.model, ModelProvider):
+                    response = self.model.chat(messages, max_tokens=800, max_attempts=remaining)
+                else:
+                    response = self.model.chat(messages, max_tokens=800)
+                attempts = min(remaining, max(1, int(response.get("request_attempts", 1)))) if isinstance(response, dict) else 1
+                self.budget_used += attempts - 1
+                request.update(request_attempts=attempts, budget_used=self.budget_used, status="returned")
             except Exception as exc:  # noqa: BLE001 - 模型失败先容错再终止
+                attempts = min(remaining, max(1, int(getattr(exc, "attempts_used", 1))))
+                self.budget_used += attempts - 1
+                request.update(request_attempts=attempts, budget_used=self.budget_used, status="model_error", error=str(exc))
                 self.model_errors.append(str(exc))
                 consecutive_failures += 1
                 if consecutive_failures >= self.max_consecutive_model_failures:
@@ -479,7 +500,10 @@ class PiAgent:
                     exc,
                 )
                 continue
+            if not isinstance(response, dict):
+                response = {"success": True, "content": None}
             if not response.get("success"):
+                request["status"] = "model_error"
                 self.model_errors.append(str(response.get("error") or "model request failed"))
                 consecutive_failures += 1
                 if consecutive_failures >= self.max_consecutive_model_failures:
@@ -492,6 +516,8 @@ class PiAgent:
             action = self._parse_action(response.get("content", ""))
             if action is None:
                 malformed += 1
+                self.parse_errors += 1
+                request["status"] = "invalid_model_output"
                 messages.append(
                     {
                         "role": "user",
@@ -503,8 +529,10 @@ class PiAgent:
                 )
                 if malformed >= 2:
                     self.stop_reason = "invalid_model_output"
+                    break
                 continue
 
+            request["status"] = "valid_action"
             if action.get("stop"):
                 self.stop_reason = "model_stopped"
                 break
@@ -561,6 +589,10 @@ class PiAgent:
             self.stop_reason = "max_steps_reached"
 
     def _finalize_hypotheses(self) -> None:
+        for item in self.hypotheses:
+            if item.status == "supported" and self._evidence_error(item.evidence_ids, supported=True):
+                item.status = "investigating"
+                item.missing_evidence.append("Supported status rejected: current tool evidence provenance is insufficient")
         if not self.hypotheses:
             dangerous = [
                 item
@@ -687,6 +719,8 @@ class PiAgent:
                     metadata={"query": args.get("query"), "value": str(item.get("value", ""))[:200]},
                 )
         elif tool_name == "ghidra.decompile_function":
+            if not isinstance(data,dict) or not isinstance(data.get('decompiled_code'),str) or not data['decompiled_code'].strip():
+                return
             name = (data.get("name") if isinstance(data, dict) else None) or args.get("function")
             self._add_auto_evidence(
                 type_="decompilation",
@@ -712,7 +746,7 @@ class PiAgent:
         metadata: dict[str, Any],
     ) -> None:
         for item in self.evidence:
-            if item.type == type_ and item.binary == binary and item.description == description:
+            if item.id in self._trusted_evidence and item.type == type_ and item.binary == binary and item.description == description:
                 return
         self.evidence.append(
             Evidence(
@@ -727,12 +761,23 @@ class PiAgent:
                 metadata=metadata,
             )
         )
+        item = self.evidence[-1]
+        self._trusted_evidence[item.id] = self._evidence_fingerprint(item)
 
     def _summary(self) -> dict[str, Any]:
-        supported = any(item.status == "supported" for item in self.hypotheses)
+        supported = any(item.status == "supported" and not self._evidence_error(item.evidence_ids, supported=True) for item in self.hypotheses)
+        last_error = bool(self.model_trace and self.model_trace[-1]["status"] in {"invalid_model_output", "model_error"})
+        all_tools_failed = bool(self.tool_trace) and not any(item["success"] for item in self.tool_trace)
+        failed = self.stop_reason in {"invalid_model_output", "model_error"} or (self.stop_reason == "max_steps_reached" and (last_error or all_tools_failed or self.max_steps <= 0))
         return {
-            "success": True,
-            "status": "complete",
+            "success": not failed,
+            "status": "failed" if failed else "complete",
+            "errors": ["model protocol/request budget failed: " + self.stop_reason] if failed else [],
+            "model_calls": self.model_calls,
+            "budget_used": self.budget_used,
+            "budget_limit": self.max_steps,
+            "parse_errors": self.parse_errors,
+            "model_trace": self.model_trace,
             "task_id": self.task_id,
             "model": self.model_info,
             "target": self._selected_binary(),
@@ -758,6 +803,7 @@ class PiAgent:
         self._save_json(self.evidence_dir / "evidence.json", output["evidence"])
         self._save_json(self.hypotheses_dir / "hypotheses.json", output["hypotheses"])
         self._save_json(self.agent_dir / "tool_trace.json", self.tool_trace)
+        self._save_json(self.agent_dir / "model_trace.json", self.model_trace)
         self._save_json(self.reports_dir / "investigation.json", output)
 
     def _build_tools(self) -> dict[str, ToolSpec]:
@@ -969,12 +1015,13 @@ class PiAgent:
                 "tool": "hypothesis.create",
                 "errors": [f"invalid hypothesis status: {status}"],
             }
-        evidence_ids = list(args.get("evidence_ids") or [])
-        if status == "supported" and len(evidence_ids) < 2:
+        evidence_ids = args.get("evidence_ids", [])
+        error = self._evidence_error(evidence_ids, supported=status == "supported")
+        if error:
             return {
                 "success": False,
                 "tool": "hypothesis.create",
-                "errors": ["supported requires at least two evidence items"],
+                "errors": [error],
             }
         hypothesis = Hypothesis(
             id=self._next_hypothesis_id(),
@@ -993,6 +1040,12 @@ class PiAgent:
         hypothesis = next((item for item in self.hypotheses if item.id == args["id"]), None)
         if hypothesis is None:
             return {"success": False, "tool": "hypothesis.update", "errors": [f"unknown hypothesis: {args['id']}"]}
+        status = args.get("status", hypothesis.status)
+        if not isinstance(status, str) or status not in VALID_HYPOTHESIS_STATUSES:
+            return {"success": False, "tool": "hypothesis.update", "errors": ["invalid hypothesis status"]}
+        error = self._evidence_error(args.get("evidence_ids", hypothesis.evidence_ids), supported=status == "supported")
+        if error:
+            return {"success": False, "tool": "hypothesis.update", "errors": [error]}
         if "title" in args:
             hypothesis.title = str(args["title"])
         if "cwe" in args:
@@ -1004,12 +1057,6 @@ class PiAgent:
                     "success": False,
                     "tool": "hypothesis.update",
                     "errors": [f"invalid hypothesis status: {status}"],
-                }
-            if status == "supported" and len(args.get("evidence_ids", hypothesis.evidence_ids)) < 2:
-                return {
-                    "success": False,
-                    "tool": "hypothesis.update",
-                    "errors": ["supported requires at least two evidence items"],
                 }
             hypothesis.status = status
         if "confidence" in args:
@@ -1117,10 +1164,30 @@ class PiAgent:
         return str(data or "success")[:300]
 
     def _stop_after_tool(self) -> bool:
-        if any(item.status == "supported" for item in self.hypotheses):
+        if any(item.status == "supported" and not self._evidence_error(item.evidence_ids, supported=True) for item in self.hypotheses):
             self.stop_reason = "hypothesis_supported"
             return True
         return False
+
+    @staticmethod
+    def _evidence_fingerprint(item: Evidence) -> str:
+        import hashlib
+        data=item.to_dict().copy();data.pop('id',None)
+        return hashlib.sha256(json.dumps(data,sort_keys=True,ensure_ascii=True,allow_nan=False).encode()).hexdigest()
+
+    def _evidence_error(self, ids: Any, *, supported: bool) -> str | None:
+        if not isinstance(ids,list) or not all(isinstance(key,str) and key for key in ids) or len(set(ids)) != len(ids):
+            return "evidence_ids must contain unique existing IDs"
+        records={item.id:item for item in self.evidence}
+        if any(key not in records for key in ids):
+            return "evidence_ids contains an unknown current-run ID"
+        if supported:
+            trusted=getattr(self,'_trusted_evidence',{})
+            if len(ids)<2 or any(key not in trusted or trusted[key] != self._evidence_fingerprint(records[key]) for key in ids):
+                return "supported requires at least two distinct unmodified current-run tool evidence items; model assertions are insufficient"
+            if len({trusted[key] for key in ids})<2:
+                return "supported requires distinct tool observations"
+        return None
 
     def _selected_binary(self) -> str | None:
         if self.binary:
@@ -1131,20 +1198,45 @@ class PiAgent:
         return None
 
     def _resolve_binary(self, binary: str) -> Path | None:
-        if not binary:
+        from fwagent.dynamic.guest_paths import guest_parts, guest_path
+        from fwagent.tools.bounded_io import read_beneath
+        if not isinstance(binary, str) or not binary:
             return None
         rootfs = (self.report or {}).get("extraction", {}).get("rootfs")
-        if binary.startswith("/") and rootfs:
-            candidate = Path(rootfs) / binary.lstrip("/")
-            try:
-                if candidate.exists():
-                    return candidate
-            except OSError:
-                pass
         try:
-            path = Path(binary)
-            return path if path.exists() else None
-        except OSError:
+            if not rootfs:return None
+            relative = "/".join(guest_parts(binary))
+            assets = {}
+            for item in [*(self.report.get("binaries") or []), *(self.report.get("priority_binaries") or [])]:
+                if not isinstance(item, dict) or not isinstance(item.get("path"), str):continue
+                try:assets["/".join(guest_parts(item["path"]))] = item
+                except ValueError:continue
+            if relative not in assets:return None
+            configured = getattr(getattr(getattr(self, "config", None), "ghidra", None), "max_binary_size_mb", 64)
+            limit = min(64*1024*1024, max(1, int(configured))*1024*1024)
+            data = read_beneath(rootfs, relative, limit=limit)
+            if not data.startswith(b"\x7fELF"):return None
+            digest = hashlib.sha256(data).hexdigest()
+            expected = assets[relative].get("sha256")
+            if expected is not None and expected != digest:return None
+            # External/static tools consume a private snapshot, never reopen a
+            # model-selected rootfs/host path after the boundary check.
+            directory = guest_path(self.task_dir, "/agent/asset-snapshots")
+            directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+            total = count = 0
+            for path in directory.iterdir():
+                count += 1
+                if count > 64 or path.is_symlink():return None
+                total += path.lstat().st_size
+            name = hashlib.sha256((relative + "\0" + digest).encode()).hexdigest() + ".elf"
+            target = directory / name
+            if target.exists():
+                if read_beneath(directory, name, limit=limit) != data:return None
+            else:
+                if total + len(data) > 128*1024*1024:return None
+                with target.open("xb") as handle:handle.write(data)
+            return target
+        except (OSError, ValueError, TypeError, AttributeError):
             return None
 
     def _require_binary(self, args: dict[str, Any]) -> Path | None:
@@ -1201,16 +1293,22 @@ class PiAgent:
         return "\n".join(f"- {spec.name}: {spec.description}" for spec in self.tools.values())
 
     def _parse_action(self, content: str) -> dict[str, Any] | None:
-        text = (content or "").strip()
-        start = text.find("{")
-        end = text.rfind("}")
-        if start < 0 or end <= start:
+        if not isinstance(content, str):
             return None
+        text = content.strip()
+        if text.startswith("```") and text.endswith("```"):
+            text = "\n".join(text.splitlines()[1:-1])
         try:
-            data = json.loads(text[start : end + 1])
-        except json.JSONDecodeError:
+            data = json.loads(text)
+        except (json.JSONDecodeError, ValueError):
             return None
-        return data if isinstance(data, dict) else None
+        if not isinstance(data, dict) or not isinstance(data.get("stop"), bool):
+            return None
+        if "reason" in data and not isinstance(data["reason"], str):
+            return None
+        if not data["stop"] and (not isinstance(data.get("tool"), str) or not data["tool"] or not isinstance(data.get("arguments"), dict)):
+            return None
+        return data
 
     def _compact_result(self, result: dict[str, Any]) -> str:
         compact = _compact_value(result)

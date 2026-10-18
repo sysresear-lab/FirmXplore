@@ -24,6 +24,47 @@ EXPORT_SCRIPTS = {
 }
 
 
+class ExportValidationError(ValueError):
+    def __init__(self, code: str, message: str):
+        self.code = code
+        super().__init__(f"{code}: {message}")
+
+
+def validate_export_payload(payload: dict[str, Any], *, expected_hash: str | None = None) -> None:
+    if not isinstance(payload, dict) or not isinstance(payload.get("summary"), dict):
+        raise ExportValidationError("GHIDRA_OUTPUT_INVALID", "summary must be an object")
+    summary = payload["summary"]
+    count = summary.get("function_count")
+    if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+        raise ExportValidationError("GHIDRA_OUTPUT_INVALID", "invalid function_count")
+    digest = summary.get("sha256")
+    if not isinstance(digest, str) or len(digest) != 64 or any(c not in "0123456789abcdefABCDEF" for c in digest):
+        raise ExportValidationError("GHIDRA_OUTPUT_INVALID", "missing/invalid target sha256")
+    if expected_hash and digest.lower() != expected_hash.lower():
+        raise ExportValidationError("GHIDRA_TARGET_MISMATCH", "export belongs to a different binary")
+    if not isinstance(summary.get("language"), str) or not summary["language"]:
+        raise ExportValidationError("GHIDRA_OUTPUT_INVALID", "missing language")
+    if not isinstance(summary.get("analysis_timed_out"), bool):
+        raise ExportValidationError("GHIDRA_OUTPUT_INVALID", "analysis_timed_out must be boolean")
+    if summary.get("analysis_timed_out") is True:
+        raise ExportValidationError("GHIDRA_TIMEOUT", "export reports analysis timeout")
+    fields = {"functions": ("name", "address"), "imports": ("name",), "exports": ("name", "address"),
+              "strings": ("address", "value"), "callgraph": ("caller", "callee", "caller_address", "callee_address")}
+    for name, required in fields.items():
+        rows = payload.get(name)
+        if not isinstance(rows, list):
+            raise ExportValidationError("GHIDRA_OUTPUT_INVALID", f"{name} must be an array")
+        for row in rows:
+            if not isinstance(row, dict) or any(not isinstance(row.get(field), str) for field in required):
+                raise ExportValidationError("GHIDRA_OUTPUT_INVALID", f"invalid {name} record")
+            if any(not row[field] for field in required if field != "value"):
+                raise ExportValidationError("GHIDRA_OUTPUT_INVALID", f"empty {name} identity")
+            if name == "imports" and not isinstance(row.get("dangerous"), bool):
+                raise ExportValidationError("GHIDRA_OUTPUT_INVALID", "imports.dangerous must be boolean")
+    if count != len(payload["functions"]):
+        raise ExportValidationError("GHIDRA_OUTPUT_INVALID", "function_count differs from functions export")
+
+
 class GhidraRuntime:
     def __init__(
         self,
@@ -86,46 +127,9 @@ class GhidraRuntime:
         }
 
     def check_container_environment(self) -> dict[str, Any]:
-        start = time.monotonic()
-        if not shutil.which("docker"):
-            return {
-                "success": False,
-                "tool": "ghidra.container_check",
-                "duration": round(time.monotonic() - start, 3),
-                "result": {"image": self.settings.docker_image},
-                "warnings": [],
-                "errors": ["docker CLI was not found"],
-            }
-        command = [
-            "docker",
-            "run",
-            "--rm",
-            "--network",
-            "none",
-            "--entrypoint",
-            "sh",
-            self.settings.docker_image,
-            "-lc",
-            'java -version; echo "GHIDRA_HOME=${GHIDRA_HOME:-/opt/ghidra}"; test -x "${GHIDRA_HOME:-/opt/ghidra}/support/analyzeHeadless"; echo "ANALYZE_HEADLESS=${GHIDRA_HOME:-/opt/ghidra}/support/analyzeHeadless"; grep -h "^application.version=" "${GHIDRA_HOME:-/opt/ghidra}/Ghidra/application.properties"',
-        ]
-        result = self.runner.run(command, timeout=60)
-        output = ((result.stdout or "") + "\n" + (result.stderr or "")).strip()
-        java_version = _extract_java_version(output)
-        return {
-            "success": result.exit_code == 0,
-            "tool": "ghidra.container_check",
-            "duration": round(time.monotonic() - start, 3),
-            "result": {
-                "image": self.settings.docker_image,
-                "java": java_version,
-                "java_version": java_version,
-                "ghidra_home": _extract_line_value(output, "GHIDRA_HOME=") or "/opt/ghidra",
-                "analyze_headless": _extract_line_value(output, "ANALYZE_HEADLESS=") or "/opt/ghidra/support/analyzeHeadless",
-                "ghidra_version": _extract_ghidra_version(output),
-            },
-            "warnings": [],
-            "errors": [] if result.exit_code == 0 else [_classify_container_error(result)],
-        }
+        return {"success": False, "tool": "ghidra.container_check", "duration": 0,
+                "result": {"image": self.settings.docker_image}, "warnings": [],
+                "errors": ["UNMANAGED_CONTAINER_EXECUTION_BLOCKED: Docker worker lacks durable cancellation supervision and output quotas"]}
 
     def analyze_headless_path(self) -> Path | None:
         candidates = [
@@ -220,97 +224,12 @@ class GhidraRuntime:
             )
 
         command_result = self.runner.run(command, timeout=self.settings.timeout_seconds + 30)
-        parsed = self._collect_export_outputs(output_dir)
-        success = command_result.exit_code == 0 and bool(parsed.get("summary"))
-        errors = []
-        warnings = []
-        if command_result.timed_out:
-            errors.append("Ghidra analysis timeout")
-        elif command_result.exit_code != 0:
-            errors.append((command_result.stderr or command_result.stdout or "Ghidra analysis failed")[:2000])
-        missing = [name for name, (_, filename) in EXPORT_SCRIPTS.items() if not (output_dir / filename).exists()]
-        if missing:
-            warnings.append(f"missing export files: {', '.join(missing)}")
-        return ToolResult(
-            success=success,
-            tool="ghidra.analyze_binary",
-            binary=str(binary_path),
-            duration=round(time.monotonic() - start, 3),
-            result={**parsed, "metadata": _execution_metadata(command_result, backend="dockerized_ghidra", image=self.settings.docker_image)},
-            warnings=warnings,
-            errors=errors,
-        )
+        return self._finish_export(binary_path, output_dir, command_result, start,
+                                   backend="host_ghidra", image=None)
 
     def export_binary_containerized(self, binary: str | Path) -> ToolResult:
-        start = time.monotonic()
-        binary_path = Path(binary).resolve()
-        project_name = self._project_name(binary_path)
-        output_dir = self.output_dir / project_name
-        output_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            workspace_relative_binary = binary_path.relative_to(self.workspace).as_posix()
-            workspace_relative_output = output_dir.relative_to(self.workspace).as_posix()
-            workspace_relative_projects = self.project_dir.relative_to(self.workspace).as_posix()
-        except ValueError as exc:
-            return ToolResult(
-                success=False,
-                tool="ghidra.analyze_binary",
-                binary=str(binary_path),
-                duration=round(time.monotonic() - start, 3),
-                result={},
-                errors=[f"binary and Ghidra project/output paths must be inside task workspace for containerized Ghidra: {exc}"],
-            )
-        container_binary = _container_task_path(workspace_relative_binary)
-        container_output = _container_task_path(workspace_relative_output)
-        container_projects = _container_task_path(workspace_relative_projects)
-        command = [
-            "docker",
-            "run",
-            "--rm",
-            "--network",
-            "none",
-            "-v",
-            f"{self.workspace}:/workspace/task",
-            "-w",
-            "/workspace/task",
-            "--entrypoint",
-            "/opt/ghidra/support/analyzeHeadless",
-            self.settings.docker_image,
-            container_projects,
-            project_name,
-            "-import",
-            container_binary,
-            "-scriptPath",
-            "/opt/fwagent/ghidra_scripts",
-            "-analysisTimeoutPerFile",
-            str(self.settings.timeout_seconds),
-        ]
-        for script, filename in EXPORT_SCRIPTS.values():
-            command.extend(["-postScript", script, str(PurePosixPath(container_output) / filename)])
-        if self.settings.delete_after_export:
-            command.append("-deleteProject")
-
-        command_result = self.runner.run(command, timeout=self.settings.timeout_seconds + 60)
-        parsed = self._collect_export_outputs(output_dir)
-        success = command_result.exit_code == 0 and bool(parsed.get("summary"))
-        errors = []
-        warnings = []
-        if command_result.timed_out:
-            errors.append("Ghidra container analysis timeout")
-        elif command_result.exit_code != 0:
-            errors.append((command_result.stderr or command_result.stdout or "Ghidra container analysis failed")[:2000])
-        missing = [name for name, (_, filename) in EXPORT_SCRIPTS.items() if not (output_dir / filename).exists()]
-        if missing:
-            warnings.append(f"missing export files: {', '.join(missing)}")
-        return ToolResult(
-            success=success,
-            tool="ghidra.analyze_binary",
-            binary=str(binary_path),
-            duration=round(time.monotonic() - start, 3),
-            result={**parsed, "metadata": _execution_metadata(command_result, backend="host_ghidra", image=None)},
-            warnings=warnings,
-            errors=errors,
-        )
+        return ToolResult(success=False, tool="ghidra.analyze_binary", binary=str(binary),
+                          result={}, errors=["UNMANAGED_CONTAINER_EXECUTION_BLOCKED: Docker export disabled until output quotas and daemon cleanup supervision are verified; host static tools remain available"])
 
     def decompile_function(self, binary: str | Path, function: str) -> ToolResult:
         start = time.monotonic()
@@ -330,14 +249,25 @@ class GhidraRuntime:
                 errors=[str(exc)],
             )
         command_result = self.runner.run(command, timeout=self.settings.timeout_seconds + 30)
-        result = _load_json(output_json) if output_json.exists() else {}
         errors = []
+        try:
+            from fwagent.tools.bounded_io import read_beneath
+            result = json.loads(read_beneath(output_json.parent,output_json.name,limit=2*1024*1024).decode('utf-8'))
+        except (OSError,ValueError,RuntimeError) as exc:
+            result = {};errors.append(f"DECOMPILATION_OUTPUT_INVALID: {type(exc).__name__}")
         if command_result.timed_out:
             errors.append("Ghidra decompilation timeout")
         elif command_result.exit_code != 0:
             errors.append((command_result.stderr or command_result.stdout or "Ghidra decompilation failed")[:2000])
+        valid = (isinstance(result,dict) and result.get('status') == 'observed'
+                 and result.get('completed') is True and result.get('timed_out') is False
+                 and isinstance(result.get('name'),str) and bool(result['name'].strip())
+                 and isinstance(result.get('address'),str) and bool(result['address'].strip())
+                 and isinstance(result.get('decompiled_code'),str) and bool(result['decompiled_code'].strip()))
+        if not valid:
+            errors.append("DECOMPILATION_UNAVAILABLE: completed nonempty function output is required")
         return ToolResult(
-            success=command_result.exit_code == 0 and bool(result),
+            success=not errors and valid,
             tool="ghidra.decompile_function",
             binary=str(binary_path),
             duration=round(time.monotonic() - start, 3),
@@ -350,11 +280,42 @@ class GhidraRuntime:
         material = f"{sha256_file(Path(binary))}:{version}:{self.settings.config_version}"
         return _safe_name(material)[:120]
 
+    def _finish_export(self, binary: Path, output_dir: Path, command_result, started: float, *, backend: str, image) -> ToolResult:
+        parsed = {}
+        code = None
+        errors = []
+        if command_result.timed_out:
+            code = "GHIDRA_TIMEOUT"
+            errors = ["Ghidra analysis timeout"]
+        elif command_result.exit_code != 0:
+            code = "GHIDRA_ANALYSIS_FAILED"
+            errors = [(command_result.stderr or command_result.stdout or "Ghidra analysis failed")[:2000]]
+        else:
+            try:
+                parsed = self._collect_export_outputs(output_dir)
+                validate_export_payload(parsed, expected_hash=sha256_file(binary))
+            except ExportValidationError as exc:
+                code, errors = exc.code, [str(exc)]
+            except OSError as exc:
+                code, errors = "GHIDRA_OUTPUT_UNREADABLE", [f"{type(exc).__name__}: {exc}"]
+        metadata = _execution_metadata(command_result, backend=backend, image=image)
+        metadata.update(error_code=code, output_dir=str(output_dir), export_contract="v1")
+        return ToolResult(success=code is None, tool="ghidra.analyze_binary", binary=str(binary),
+                          duration=round(time.monotonic() - started, 3), result={**parsed, "metadata": metadata}, errors=errors)
+
     def _collect_export_outputs(self, output_dir: Path) -> dict[str, Any]:
-        collected: dict[str, Any] = {}
+        # Every file below is emitted unconditionally by build_export_command.
+        # Empty arrays are valid; absent files and malformed arrays are not.
+        collected = {}
         for name, (_, filename) in EXPORT_SCRIPTS.items():
             path = output_dir / filename
-            collected[name] = _load_json(path) if path.exists() else ([] if name != "summary" else {})
+            if not path.is_file():
+                raise ExportValidationError("GHIDRA_OUTPUT_MISSING", f"missing required export: {filename}")
+            try:
+                collected[name] = _load_json(path)
+            except (json.JSONDecodeError, UnicodeError) as exc:
+                raise ExportValidationError("GHIDRA_JSON_INVALID", f"{filename}: {exc}") from exc
+        validate_export_payload(collected)
         return collected
 
     def _project_name(self, binary: Path) -> str:

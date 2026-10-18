@@ -38,6 +38,7 @@ from fwagent.dynamic.validation import (
 )
 from fwagent.dynamic.workspace import DynamicWorkspace
 from fwagent.runtime.command import CommandRunner
+from fwagent.runtime.execution_policy import BLOCK_CODE, blocked_execution
 
 
 HTTP_MAX_BODY_BYTES = 64 * 1024
@@ -777,6 +778,8 @@ class DynamicToolAPI:
         return {"success": result["success"], "tool": "dynamic.prepare_firmware", "result": result}
 
     def _boot_firmware(self, args: dict[str, Any]) -> dict[str, Any]:
+        if getattr(self.backend.boot, "execution_blocked", False):
+            return {"success": False, "tool": "dynamic.boot_firmware", "result": blocked_execution("dynamic.boot_firmware")}
         firmware = self.workspace.resolve_firmware()
         if not firmware:
             return {"success": False, "tool": "dynamic.boot_firmware", "errors": ["firmware not found"]}
@@ -1921,6 +1924,9 @@ class DynamicToolAPI:
         *,
         target: str | None = None,
     ) -> None:
+        if result.get("error_code") == BLOCK_CODE:
+            # An execution policy refusal is not a runtime attempt/observation.
+            return
         if evidence_type not in DYNAMIC_EVIDENCE_TYPES:
             return
         runtime_observation_real = _is_real_runtime_observation(evidence_type, result)

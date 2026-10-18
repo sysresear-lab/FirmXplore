@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import fnmatch
+import io
 import re
 import time
 from dataclasses import asdict, dataclass, field
@@ -8,7 +10,9 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from fwagent.runtime.command import CommandRunner
-from fwagent.tools.common import extract_ascii_strings, iter_files, sha256_file
+from fwagent.dynamic.guest_paths import guest_parts, guest_path
+from fwagent.tools.bounded_io import read_beneath
+from fwagent.tools.common import extract_ascii_strings, iter_files, safe_read_text, sha256_file
 
 
 APPLICATION_EVIDENCE_TYPES = {
@@ -408,7 +412,7 @@ def reconstruct_endpoints(rootfs: str | Path, profile: FastCGILaunchProfile) -> 
         for path in iter_files(www):
             if path.suffix.lower() not in {".html", ".htm", ".js", ".json", ".css"}:
                 continue
-            text = path.read_text(encoding="utf-8", errors="replace")[:1024 * 1024]
+            text = safe_read_text(path, errors="replace")
             source = "/" + path.relative_to(root).as_posix()
             for endpoint, methods, params in _extract_frontend_endpoints(text):
                 backend = profile.binary if profile.route and endpoint.startswith(profile.route.rstrip("/") + "/") or endpoint == profile.route else None
@@ -852,28 +856,57 @@ def _run_or_empty(runner: CommandRunner | None, command: list[str]) -> str:
     return (result.stdout or result.stderr or "")[:512 * 1024]
 
 
-def _collect_lighttpd_config(root: Path, config_file: str, visited: set[str], lines: list[dict[str, Any]]) -> None:
-    normalized = "/" + config_file.lstrip("/")
+MAX_INCLUDE_DEPTH = 16
+MAX_INCLUDE_FILES = 128
+MAX_INCLUDE_FILE_BYTES = 256 * 1024
+MAX_INCLUDE_TOTAL_BYTES = 2 * 1024 * 1024
+MAX_INCLUDE_LINES = 20000
+MAX_INCLUDE_ENUMERATED = 4096
+
+
+def _collect_lighttpd_config(root: Path, config_file: str, visited: set[str], lines: list[dict[str, Any]], *, depth: int = 0, budget: dict | None = None) -> None:
+    normalized = "/" + "/".join(guest_parts(config_file))
     if normalized in visited:
         return
-    visited.add(normalized)
-    path = _root_path(root, normalized)
-    if not path.exists():
+    if depth >= MAX_INCLUDE_DEPTH:raise ValueError("include recursion depth budget exceeded")
+    budget = budget if budget is not None else {"files": 0, "bytes": 0, "lines": 0}
+    if budget["files"] >= MAX_INCLUDE_FILES:raise ValueError("include file count budget exceeded")
+    remaining = MAX_INCLUDE_TOTAL_BYTES - budget["bytes"]
+    if remaining <= 0:raise ValueError("include cumulative byte budget exceeded")
+    try:data = read_beneath(root, normalized, limit=min(MAX_INCLUDE_FILE_BYTES, remaining))
+    except FileNotFoundError:
         return
-    for lineno, line in enumerate(path.read_text(encoding="utf-8", errors="replace").splitlines(), start=1):
+    visited.add(normalized)
+    budget["files"] += 1;budget["bytes"] += len(data)
+    for lineno, raw_line in enumerate(io.StringIO(data.decode("utf-8", errors="replace")), start=1):
+        budget["lines"] += 1
+        if budget["lines"] > MAX_INCLUDE_LINES:raise ValueError("include line count budget exceeded")
+        line = raw_line.rstrip("\r\n")
         stripped = line.strip()
         include_match = re.match(r'include(?:_shell)?\s+"([^"]+)"', stripped)
         if include_match and not stripped.startswith("#"):
             pattern = include_match.group(1)
             for included in _resolve_include_pattern(root, pattern):
-                _collect_lighttpd_config(root, included, visited, lines)
+                _collect_lighttpd_config(root, included, visited, lines, depth=depth+1, budget=budget)
         lines.append({"source": normalized, "line": lineno, "text": line})
 
 
 def _resolve_include_pattern(root: Path, pattern: str) -> list[str]:
-    candidate = _root_path(root, pattern)
+    parts = guest_parts(pattern)
     if any(char in pattern for char in "*?[]"):
-        return ["/" + path.relative_to(root).as_posix() for path in root.glob(pattern.lstrip("/")) if path.is_file()]
+        if not parts or any(any(c in part for c in "*?[]") for part in parts[:-1]) or "**" in parts[-1]:
+            raise ValueError("include wildcard directories/recursive globs are unsupported")
+        parent = _root_path(root, "/" + "/".join(parts[:-1]))
+        matches = []
+        for index, child in enumerate(parent.iterdir()):
+            if index >= MAX_INCLUDE_ENUMERATED:raise ValueError("include directory enumeration budget exceeded")
+            if fnmatch.fnmatchcase(child.name, parts[-1]):
+                relative = "/" + "/".join((*parts[:-1], child.name))
+                candidate = _root_path(root, relative)
+                if candidate.is_file():matches.append(relative)
+                if len(matches) > MAX_INCLUDE_FILES:raise ValueError("include wildcard file budget exceeded")
+        return sorted(matches)
+    candidate = _root_path(root, pattern)
     return [pattern] if candidate.exists() else []
 
 
@@ -1049,7 +1082,7 @@ def _extract_tokens_from_frontend(root: Path, pattern: str) -> set[str]:
     for path in iter_files(www):
         if path.suffix.lower() not in {".html", ".htm", ".js"}:
             continue
-        tokens.update(compiled.findall(path.read_text(encoding="utf-8", errors="replace")[:1024 * 1024]))
+        tokens.update(compiled.findall(safe_read_text(path, errors="replace")))
     return tokens
 
 
@@ -1116,7 +1149,7 @@ def _path_exists(path: Path) -> bool:
 
 
 def _root_path(rootfs: Path, firmware_path: str) -> Path:
-    return rootfs / firmware_path.lstrip("/")
+    return guest_path(rootfs, firmware_path)
 
 
 def _first_quoted(value: str) -> str | None:

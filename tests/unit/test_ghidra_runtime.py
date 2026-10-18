@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from fwagent.config import GhidraSettings
 from fwagent.models import CommandResult
@@ -72,7 +73,10 @@ class GhidraRuntimeTests(unittest.TestCase):
                 runner=runner,
             )
 
-            result = runtime.check_container_environment()
+            # FakeRunner does not execute Docker; CLI discovery belongs to this
+            # fixture too, rather than depending on Docker installed on the host.
+            with patch("fwagent.runtime.ghidra.shutil.which", return_value="controlled-docker"):
+                result = runtime.check_container_environment()
 
             self.assertTrue(result["success"])
             self.assertEqual(result["result"]["image"], "firmxplore:latest")

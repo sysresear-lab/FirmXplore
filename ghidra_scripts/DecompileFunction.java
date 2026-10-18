@@ -14,20 +14,35 @@ public class DecompileFunction extends GhidraScript {
         Function function = findFunction(target);
         String code = "";
         String address = "";
+        boolean completed = false;
+        boolean timedOut = false;
+        String reason = "function_not_found";
         if (function != null) {
             address = function.getEntryPoint().toString();
             DecompInterface decompiler = new DecompInterface();
-            decompiler.openProgram(currentProgram);
-            DecompileResults results = decompiler.decompileFunction(function, 60, monitor);
-            if (results != null && results.decompileCompleted() && results.getDecompiledFunction() != null) {
-                code = results.getDecompiledFunction().getC();
-                if (code.length() > maxChars) {
-                    code = code.substring(0, maxChars);
+            try {
+                reason = "decompilation_unavailable";
+                if (decompiler.openProgram(currentProgram)) {
+                    DecompileResults results = decompiler.decompileFunction(function, 60, monitor);
+                    timedOut = results != null && results.isTimedOut();
+                    if (results != null && results.decompileCompleted() && !timedOut && results.getDecompiledFunction() != null) {
+                        code = results.getDecompiledFunction().getC();
+                        completed = code != null && !code.trim().isEmpty();
+                        reason = completed ? "completed" : "empty_decompiled_code";
+                        if (completed && code.length() > Math.max(1, maxChars)) {
+                            code = code.substring(0, Math.max(1, maxChars));
+                        }
+                    }
                 }
+            } finally {
+                decompiler.dispose();
             }
-            decompiler.dispose();
         }
         String json = "{"
+            + "\"status\":\"" + (completed ? "observed" : "unavailable") + "\","
+            + "\"completed\":" + completed + ","
+            + "\"timed_out\":" + timedOut + ","
+            + "\"reason\":\"" + esc(reason) + "\","
             + "\"name\":\"" + esc(target) + "\","
             + "\"address\":\"" + esc(address) + "\","
             + "\"callers\":[],"

@@ -15,6 +15,7 @@ from fwagent.pipeline.product import (
     score_rootfs_candidate,
     select_canonical_rootfs_candidate,
     validate_rootfs_candidate,
+    _validate_rootfs_candidate,
 )
 from fwagent.reporting.final_report import ReportGenerator
 from fwagent.tools.architecture import identify_architecture
@@ -208,7 +209,8 @@ class ExtractionRecoveryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             rootfs = make_rootfs(Path(tmp) / "rootfs")
             with patch("fwagent.pipeline.product._safe_walk", return_value=[(str(rootfs), [], ["badlink"])]), patch.object(Path, "is_symlink", side_effect=OSError("bad link")):
-                result = validate_rootfs_candidate(rootfs)
+                # In-process unit for injected stat errors; public worker isolation is tested separately.
+                result = _validate_rootfs_candidate(rootfs)
             self.assertFalse(result["valid"])
 
     def test_broken_symlink_skipped_when_supported(self) -> None:

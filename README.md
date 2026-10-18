@@ -73,7 +73,7 @@ The workflow is intentionally conservative: reachability is not treated as explo
 FirmXplore is not documented here as a PyPI package. Install from the repository:
 
 ```bash
-git clone https://github.com/Falcons-Lab/FirmXplore.git
+git clone https://github.com/iceflower-lab/FirmXplore.git
 cd FirmXplore
 python -m pip install -e .
 ```

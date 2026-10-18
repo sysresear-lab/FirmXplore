@@ -10,6 +10,7 @@ from typing import Any
 
 from fwagent import __version__
 from fwagent.dynamic.models import is_canonical_runtime_evidence
+from fwagent.dynamic.surface_contract import surface_summary, COUNT_FIELDS
 from fwagent.findings import FindingClaimGuard, FINDING_STATUSES
 
 
@@ -151,10 +152,28 @@ class ReportGenerator:
         analysis = self._load("reports/analysis.json")
         investigation = self._load("investigation/summary.json")
         surface = self._load("surface/attack_surface_summary.json")
-        entries = self._load("surface/entry_points.json") or []
+        raw_entries = self._load("surface/entry_points.json")
+        entries = raw_entries if isinstance(raw_entries, list) else []
+        surface = surface_summary(surface, raw_entries, self._load("surface/routes.json"))
         graph = self._load("correlation/summary.json")
         graph_full = self._load("correlation/component_graph.json")
         pipeline = self._load("pipeline_stages.json")
+        coverage = dict(pipeline.get("coverage") or {}) if isinstance(pipeline, dict) else {}
+        coverage.update({key: surface[key] for key in COUNT_FIELDS})
+        coverage["surface_entries"] = surface["candidate_entries_total"]
+        coverage["surface_count_status"] = surface["count_status"]
+        stages = [dict(item) for item in pipeline.get("stages", [])] if isinstance(pipeline, dict) else []
+        for stage in stages:
+            if stage.get("stage") != "ATTACK_SURFACE":
+                continue
+            if stage.get("status") in {"pending", "skipped", "blocked"}:
+                stage["items_processed"] = None
+                stage["item_count_status"] = "not_executed"
+            elif "item_count_status" not in stage or stage["item_count_status"] is None:
+                stage["original_items_processed"] = stage.get("items_processed")
+                stage["items_processed"] = surface["candidate_entries_total"]
+                stage["item_count_status"] = surface["count_status"]
+                stage["item_count_source"] = "surface candidate count adapter; not a new execution"
         taint = self._load("taint/summary.json")
         priority = self._load("prioritization/scheduler_state.json") or {"assessments": self._load("prioritization/assessment.json") or []}
         hypotheses = self._load("dynamic/hypotheses.json") or []
@@ -213,8 +232,8 @@ class ReportGenerator:
             remaining_problems=self._remaining_problems(findings, blocked),
             provider_status={"provider_backed": False, "planner": "deterministic", "real_model_validation": "deferred"},
             artifact_index=[item.to_dict() for item in self._artifact_index()],
-            pipeline_stages=(pipeline.get("stages") if isinstance(pipeline, dict) else []) or [],
-            coverage=(pipeline.get("coverage") if isinstance(pipeline, dict) else {}) or {},
+            pipeline_stages=stages,
+            coverage=coverage,
             validation_gaps=(pipeline.get("validation_gaps") if isinstance(pipeline, dict) else []) or [],
             taint_summary=taint if isinstance(taint, dict) else {},
             priority_summary=priority if isinstance(priority, dict) else {},
@@ -362,7 +381,7 @@ class ReportGenerator:
                 "| {stage} | {status} | {processed} | {succeeded} | {failed} | {skipped} | {duration} |".format(
                     stage=stage.get("stage") or "unknown",
                     status=stage.get("status") or "unknown",
-                    processed=stage.get("items_processed", 0),
+                    processed=self._processed_display(stage),
                     succeeded=stage.get("items_succeeded", 0),
                     failed=stage.get("items_failed", 0),
                     skipped=stage.get("items_skipped", 0),
@@ -370,6 +389,39 @@ class ReportGenerator:
                 )
             )
         return rows
+
+    @staticmethod
+    def _processed_display(stage: dict[str, Any]) -> Any:
+        if stage.get("item_count_status") == "not_executed":
+            return "not executed"
+        value = stage.get("items_processed")
+        return "unknown" if value is None else value
+
+    @staticmethod
+    def _surface_metrics(model: AnalysisReport) -> list[tuple[str, Any]]:
+        summary = model.attack_surface_summary
+        return [(label, summary.get(key)) for label, key in (
+            ("Candidate entries", "candidate_entries_total"),
+            ("Runtime confirmed entries", "runtime_confirmed_entries"),
+            ("File/symlink candidates", "file_or_symlink_candidates"),
+            ("API inferred candidates", "api_inferred_candidates"),
+            ("Heuristic candidates", "heuristic_candidates"),
+            ("Unknown evidence candidates", "unknown_evidence_candidates"),
+            ("Route mappings", "route_mappings_total"),
+            ("Static http_route candidates", "http_route_candidates"),
+        )]
+
+    def _surface_markdown(self, model: AnalysisReport) -> list[str]:
+        return [f"- {label}: `{value if value is not None else 'unknown'}`" for label, value in self._surface_metrics(model)] + [
+            "- Static candidates do not establish reachable services or verified URLs. Confidence is a rule score, not a probability.",
+            "", "| Candidate ID | Evidence level | Runtime confirmed | Rootfs file | URL |",
+            "| --- | --- | --- | --- | --- |",
+            *["| " + " | ".join(str(value).replace("|", "\\|").replace("\n", " ") for value in (
+                item.get("entry_id", "unknown"), item.get("evidence_level", "unknown"),
+                item.get("runtime_confirmed", "unknown"), item.get("filesystem_path") or "unknown",
+                item.get("url_path") or "unconfirmed",
+            )) + " |" for item in model.attack_surface],
+        ]
 
     def generate_markdown(self, model: AnalysisReport) -> Path:
         path = self.reports_dir / "report.md"
@@ -449,8 +501,7 @@ class ReportGenerator:
                 "",
                 "## 9. Attack Surface",
                 "",
-                f"- Entry points: `{len(model.attack_surface)}`",
-                f"- Summary: `{model.attack_surface_summary.get('entry_points', model.attack_surface_summary.get('total_entry_points', 'not established'))}`",
+                *self._surface_markdown(model),
                 "",
                 "## 10. Taint & Hypotheses",
                 "",
@@ -496,7 +547,9 @@ class ReportGenerator:
         )
         for artifact in model.artifact_index:
             lines.append(f"- `{artifact.get('path')}` ({artifact.get('type')}): {artifact.get('description')} — exists={artifact.get('exists')}")
-        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        # Firmware text is literal report content, including for Markdown
+        # renderers that enable raw HTML. JSON retains the original values.
+        path.write_text(html.escape("\n".join(lines), quote=False) + "\n", encoding="utf-8")
         return path
 
     def _legacy_generate_markdown_unused(self, model: AnalysisReport) -> Path:
@@ -522,8 +575,7 @@ class ReportGenerator:
             "",
             "## Attack Surface",
             "",
-            f"- Entry points: `{len(model.attack_surface)}`",
-            f"- Summary: `{model.attack_surface_summary.get('entry_points', model.attack_surface_summary.get('total_entry_points', 'not established'))}`",
+            *self._surface_markdown(model),
             "",
             "## Component Overview",
             "",
@@ -589,16 +641,17 @@ class ReportGenerator:
         path = self.reports_dir / "report.html"
         coverage = model.coverage or {}
         finding_rows = "\n".join(
-            f"<tr><td>{html.escape(item.get('finding_id',''))}</td><td>{html.escape(item.get('title',''))}</td><td><span class='badge'>{html.escape(item.get('status',''))}</span></td><td>{html.escape(item.get('severity_hint','unknown'))}</td><td>{item.get('confidence',0)}</td></tr>"
+            f"<tr><td>{html.escape(item.get('finding_id',''))}</td><td>{html.escape(item.get('title',''))}</td><td><span class='badge'>{html.escape(item.get('status',''))}</span></td><td>{html.escape(item.get('severity_hint','unknown'))}</td><td>{html.escape(str(item.get('confidence',0)))}</td></tr>"
             for item in model.findings
         )
         finding_details = "\n".join(self._finding_html(item) for item in model.findings)
         attack_rows = "\n".join(
-            f"<tr><td>{html.escape(str(item.get('entry_id') or item.get('id') or ''))}</td><td>{html.escape(str(item.get('entry_type') or item.get('type') or ''))}</td><td>{html.escape(str(item.get('component_id') or item.get('target_component_id') or ''))}</td></tr>"
+            f"<tr><td>{html.escape(str(item.get('entry_id') or item.get('id') or ''))}</td><td>{html.escape(str(item.get('entry_type') or item.get('type') or ''))}</td><td>{html.escape(str(item.get('component_id') or item.get('target_component_id') or ''))}</td><td>{html.escape(str(item.get('evidence_level') or 'unknown'))}</td><td>{html.escape(str(item.get('filesystem_path') or 'unknown'))}</td><td>{html.escape(str(item.get('url_path') or 'unconfirmed'))}</td></tr>"
             for item in model.attack_surface[:50]
         )
+        surface_metrics = "\n".join(f"<p>{html.escape(label)}: <code>{html.escape(str(value if value is not None else 'unknown'))}</code></p>" for label, value in self._surface_metrics(model))
         stage_rows = "\n".join(
-            f"<tr><td>{html.escape(str(item.get('stage')))}</td><td>{html.escape(str(item.get('status')))}</td><td>{html.escape(str(item.get('items_processed', 0)))}</td><td>{html.escape(str(item.get('items_succeeded', 0)))}</td><td>{html.escape(str(item.get('items_failed', 0)))}</td><td>{html.escape(str(item.get('duration', 0)))}</td></tr>"
+            f"<tr><td>{html.escape(str(item.get('stage')))}</td><td>{html.escape(str(item.get('status')))}</td><td>{html.escape(str(self._processed_display(item)))}</td><td>{html.escape(str(item.get('items_succeeded', 0)))}</td><td>{html.escape(str(item.get('items_failed', 0)))}</td><td>{html.escape(str(item.get('duration', 0)))}</td></tr>"
             for item in model.pipeline_stages
         )
         gaps = "".join(f"<li>{html.escape(str(item))}</li>" for item in model.validation_gaps)
@@ -647,13 +700,15 @@ code {{ background: #e2e8f0; padding: .1rem .25rem; border-radius: 4px; }}
 <h2>Finding Details</h2>
 {finding_details or '<p>No final findings were promoted from canonical evidence.</p>'}
 <h2>Attack Surface</h2>
-<table><thead><tr><th>Entry</th><th>Type</th><th>Component</th></tr></thead><tbody>{attack_rows}</tbody></table>
+{surface_metrics}
+<p>Static candidates do not establish reachable services or verified URLs. Confidence is a rule score, not a probability.</p>
+<table><thead><tr><th>Entry candidate</th><th>Type (unconfirmed unless runtime confirmed)</th><th>Component</th><th>Evidence level</th><th>Rootfs file</th><th>URL</th></tr></thead><tbody>{attack_rows}</tbody></table>
 <h2>Component Summary</h2>
 <p>Components: <code>{html.escape(str(len(model.components) or model.component_summary.get('total_components', 0)))}</code></p>
 <h2>Investigation Timeline</h2>
 <ul>{timeline or '<li>Not executed.</li>'}</ul>
 <h2>Evidence Counts</h2>
-<p>Total: <code>{model.evidence_summary.get('total', 0)}</code>, Dynamic: <code>{model.evidence_summary.get('dynamic', 0)}</code></p>
+<p>Total: <code>{html.escape(str(model.evidence_summary.get('total', 0)))}</code>, Dynamic: <code>{html.escape(str(model.evidence_summary.get('dynamic', 0)))}</code></p>
 <h2>Validation Gaps</h2>
 <ul>{gaps or '<li>No validation gaps recorded.</li>'}</ul>
 <h2>Safety / Scope Notes</h2>
@@ -703,7 +758,7 @@ code {{ background: #e2e8f0; padding: .1rem .25rem; border-radius: 4px; }}
         chain = finding.get("evidence_chain") or {}
         return f"""<details>
 <summary>{html.escape(finding.get('finding_id',''))}: {html.escape(finding.get('title',''))}</summary>
-<p><strong>Status:</strong> {html.escape(finding.get('status',''))} | <strong>Confidence:</strong> {finding.get('confidence',0)} | <strong>Severity:</strong> {html.escape(finding.get('severity_hint','unknown'))}</p>
+<p><strong>Status:</strong> {html.escape(finding.get('status',''))} | <strong>Confidence:</strong> {html.escape(str(finding.get('confidence',0)))} | <strong>Severity:</strong> {html.escape(finding.get('severity_hint','unknown'))}</p>
 <p>{html.escape(finding.get('summary',''))}</p>
 <p><strong>Entry:</strong> {html.escape(', '.join(finding.get('entry_point_ids') or []) or 'not established')}</p>
 <p><strong>Source → Sink:</strong> {html.escape(', '.join(chain.get('source') or []) or 'not established')} → {html.escape(', '.join(chain.get('sink') or []) or 'not established')}</p>

@@ -1,7 +1,7 @@
 """SQLAlchemy 引擎与会话管理。"""
 from __future__ import annotations
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
 from . import config
@@ -27,6 +27,12 @@ def init_db() -> None:
     config.UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
     config.WORKSPACE_ROOT.mkdir(parents=True, exist_ok=True)
     Base.metadata.create_all(bind=engine)
+    # Additive compatibility only. Existing task snapshots and owners are not
+    # rewritten; legacy owner=NULL rows remain quarantined.
+    columns = {item["name"] for item in inspect(engine).get_columns("tasks")}
+    if "owner_id" not in columns:
+        with engine.begin() as connection:
+            connection.execute(text("ALTER TABLE tasks ADD COLUMN owner_id VARCHAR(32)"))
 
 
 def get_db():

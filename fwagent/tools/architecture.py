@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections import Counter
 from pathlib import Path
 
-from fwagent.tools.common import display_path, read_prefix
+from fwagent.tools.common import display_path, is_regular_file, read_prefix
 
 
 ELF_MACHINES = {
@@ -54,6 +54,8 @@ def identify_architecture(rootfs: str | Path, elf_files: list[str] | None = None
 
 def parse_elf_header(path: Path) -> dict | None:
     header = read_prefix(path, 64)
+    if header[:4] == b"\x7fELF" and len(header) < 20:
+        raise ValueError(f"truncated ELF header: {path}")
     if len(header) < 20 or header[:4] != b"\x7fELF":
         return None
     elf_class = header[4]
@@ -87,7 +89,7 @@ def _resolve_elf_paths(root: Path, elf_files: list[str]) -> list[Path]:
             path = root / entry.lstrip("/")
         else:
             path = Path(entry)
-        if path.exists():
-            paths.append(path.resolve())
+        if is_regular_file(path):
+            paths.append(path.absolute())
     return paths
 

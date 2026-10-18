@@ -47,6 +47,7 @@ def build_parser() -> argparse.ArgumentParser:
     analyze.add_argument("firmware_file", help="Firmware image or archive to analyze")
     analyze.add_argument("--workspace", default="workspace", help="Workspace root directory")
     analyze.add_argument("--timeout", type=int, default=600, help="Extraction timeout in seconds")
+    analyze.add_argument("--scan-timeout", type=float, default=None, help="Shared base scan deadline in seconds (default 300, max 3600; FWAGENT_SCAN_TIMEOUT_SECONDS)")
     analyze.add_argument("--task-id", default=None, help="Explicit task id to create or resume")
     analyze.add_argument("--resume", action="store_true", help="Resume an existing task id")
     analyze.add_argument("--report-format", default="json,md,html", help="Comma-separated report formats: json,md,html")
@@ -555,6 +556,7 @@ def main(argv: list[str] | None = None) -> int:
             output_dir=args.output,
             progress=not args.quiet and not args.json,
             timeout=args.timeout,
+            scan_timeout=args.scan_timeout,
         )
         if args.json:
             print(json.dumps(result, indent=2, sort_keys=True))

@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import subprocess
 import sys
 import threading
@@ -28,10 +29,11 @@ from pathlib import Path
 
 from sqlalchemy.orm import Session
 
-from . import config
+from . import config, security
 from .database import SessionLocal
-from .models import Task
+from .models import Task, TaskCredential
 from .schemas import StreamEvent
+from .task_config import is_current_snapshot, validate_task_config
 
 logger = logging.getLogger("firmxplore.web")
 
@@ -257,7 +259,18 @@ async def run_analysis(task_id: str, *, resume: bool = False) -> None:
         task = db.get(Task, task_id)
         if task is None:
             return
+        if task.owner_id is None or not is_current_snapshot(task.config_json):
+            logger.warning("refusing quarantined legacy task %s", task_id)
+            return
         cfg = dict(task.config_json or {})
+        credential = db.get(TaskCredential, task_id)
+        api_key = ""
+        if not cfg["deterministic"] and credential is not None:
+            if credential.owner_id != task.owner_id:
+                raise ValueError("task credential owner mismatch")
+            api_key = security.decrypt(credential.ciphertext)
+            if api_key is None:
+                raise ValueError("task credential cannot be decrypted; reconfigure a new task")
         firmware_path = task.upload_path or ""
         task.status = "running"
         task.stage = "resuming" if resume else PHASE_MAP["task_create"][0]
@@ -269,7 +282,8 @@ async def run_analysis(task_id: str, *, resume: bool = False) -> None:
     task_dir.mkdir(parents=True, exist_ok=True)
     options = cfg.get("options") or {}
 
-    # spec 通过 JSON 文件传递，避免命令行长度/编码问题（api_key 也在其中）
+    # Public spec only. The secret travels once over stdin, never an artifact,
+    # command-line argument or an inherited parent model configuration.
     spec = {
         "task_id": task_id,
         "firmware_path": firmware_path,
@@ -288,12 +302,27 @@ async def run_analysis(task_id: str, *, resume: bool = False) -> None:
         _stop_requested.discard(task_id)
 
     def _launch() -> subprocess.Popen:
-        return subprocess.Popen(
+        process = subprocess.Popen(
             [sys.executable, "-m", "web.server.runner", str(spec_path)],
             cwd=str(config.PROJECT_ROOT),
             stdout=subprocess.DEVNULL,  # 子进程内部已重定向到 web_console.log
             stderr=subprocess.DEVNULL,
+            stdin=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            env={key: value for key, value in os.environ.items() if key.upper() in {
+                "PATH", "PYTHONPATH", "SYSTEMROOT", "WINDIR", "COMSPEC", "TEMP", "TMP",
+                "HOME", "USERPROFILE", "LANG", "LC_ALL", "PYTHONDONTWRITEBYTECODE",
+            }},
         )
+        try:
+            process.stdin.write(json.dumps({"api_key": api_key}) + "\n")
+            process.stdin.close()
+        except (OSError, ValueError):
+            process.kill()
+            process.wait(timeout=5)
+            raise RuntimeError("runner credential handoff failed") from None
+        return process
 
     process = await asyncio.to_thread(_launch)
     with _processes_lock:
@@ -392,15 +421,22 @@ def is_running(task_id: str) -> bool:
     return process is not None and process.poll() is None
 
 
-def create_task_row(filename: str, upload_path: Path, cfg: dict, file_size: int) -> str:
+def create_task_row(filename: str, upload_path: Path, cfg: dict, file_size: int, *, owner_id: str, api_key: str | None = None) -> str:
+    cfg = validate_task_config(cfg)
+    if not isinstance(owner_id, str) or not owner_id:
+        raise ValueError("task owner required")
+    if api_key is not None and (not isinstance(api_key, str) or len(api_key) > 512):
+        raise ValueError("invalid private credential type or length")
     task_id = uuid.uuid4().hex[:12]
     db: Session = SessionLocal()
     try:
         db.add(Task(
-            id=task_id, filename=filename, status="pending", stage="queued", progress=0,
+            id=task_id, owner_id=owner_id, filename=filename, status="pending", stage="queued", progress=0,
             config_json=cfg, upload_path=str(upload_path),
             workspace_path=str(config.WORKSPACE_ROOT / task_id), file_size=file_size,
         ))
+        if api_key and not cfg["deterministic"]:
+            db.add(TaskCredential(task_id=task_id, owner_id=owner_id, ciphertext=security.encrypt(api_key)))
         db.commit()
     finally:
         db.close()

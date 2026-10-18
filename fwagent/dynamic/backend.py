@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+from fwagent.runtime.execution_policy import deny_unisolated_execution
+
 import json
+from fwagent.tools.common import safe_read_text
 import os
 import re
 import signal
 import shutil
 import socket
 import subprocess
+import uuid
 import time
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -33,6 +37,7 @@ from fwagent.dynamic.application import (
     save_application_json,
 )
 from fwagent.dynamic.config import DynamicConfig
+from fwagent.dynamic.guest_paths import GuestRoot, artifact_name, guest_parts, guest_path
 from fwagent.dynamic.fastcgi_harness import default_fastcgi_params, run_fastcgi_harness
 from fwagent.dynamic.compat.image_builder import FirmwareImageBuilder, UserspaceImageBuilder
 from fwagent.dynamic.models import EmulationState
@@ -94,6 +99,7 @@ class FirmAEBackend(EmulationBackend):
     def prepare(self, firmware_path: str | Path) -> dict[str, Any]:
         return self.runtime.prepare(firmware_path)
 
+    @deny_unisolated_execution
     def boot(self, firmware_path: str | Path, *, timeout: int = 300) -> dict[str, Any]:
         return self.runtime.boot(firmware_path, timeout=timeout)
 
@@ -119,6 +125,7 @@ class QEMUBackend(EmulationBackend):
     def prepare(self, firmware_path: str | Path) -> dict[str, Any]:
         return {"success": True, "firmware": str(firmware_path)}
 
+    @deny_unisolated_execution
     def boot(self, firmware_path: str | Path, *, timeout: int = 300) -> dict[str, Any]:
         return self.runtime.start(firmware_path)
 
@@ -174,7 +181,7 @@ class DockerQemuBackend(EmulationBackend):
             rootfs = Path(report.get("extraction", {}).get("rootfs") or "")
             dv = rootfs / "etc" / "defnodes" / "defaultvalue.xml"
             if dv.is_file():
-                m = _re.search(r"<ipaddr>(192\.168\.[0-9.]+)</ipaddr>", dv.read_text(encoding="utf-8", errors="ignore"))
+                m = _re.search(r"<ipaddr>(192\.168\.[0-9.]+)</ipaddr>", safe_read_text(dv, limit=-1))
                 if m:
                     return m.group(1)
         except Exception:  # noqa: BLE001
@@ -208,6 +215,7 @@ class DockerQemuBackend(EmulationBackend):
             "errors": result.errors,
         }
 
+    @deny_unisolated_execution
     def boot(self, firmware_path: str | Path, *, timeout: int = 300) -> dict[str, Any]:
         prepared = self.prepare(firmware_path)
         if not prepared.get("success"):
@@ -578,6 +586,7 @@ class QemuUserServiceBackend(EmulationBackend):
             }
         return {"success": True, "rootfs": resolution["path"], "rootfs_provenance": resolution}
 
+    @deny_unisolated_execution
     def boot(self, firmware_path: str | Path, *, timeout: int = 120) -> dict[str, Any]:
         prepared = self.prepare(firmware_path)
         if not prepared.get("success"):
@@ -676,6 +685,7 @@ class QemuUserServiceBackend(EmulationBackend):
         save_json(self._service_dir(service) / "feasibility.json", payload)
         return {"success": True, "assessment": payload}
 
+    @deny_unisolated_execution
     def smoke_test_executable(self, binary: str, *, timeout_seconds: int = 10) -> dict[str, Any]:
         report = self.workspace.load_report()
         resolution = resolve_runtime_rootfs(self.workspace.task_dir, report)
@@ -726,6 +736,7 @@ class QemuUserServiceBackend(EmulationBackend):
         save_json(self.workspace.dynamic_dir / "runtime-smoke" / f"{Path(binary).name}.json", payload)
         return payload
 
+    @deny_unisolated_execution
     def trace_service_startup(self, service: str, *, timeout_seconds: int = 10) -> dict[str, Any]:
         """Run one bounded, non-networked syscall trace against the canonical RootFS."""
         report = self.workspace.load_report()
@@ -781,6 +792,7 @@ class QemuUserServiceBackend(EmulationBackend):
         return payload
 
     def prepare_service(self, service: str, *, force_reconstruct: bool = False) -> dict[str, Any]:
+        artifact_name(service)
         rootfs = self._rootfs()
         if rootfs is None:
             return {"success": False, "errors": ["rootfs not available"]}
@@ -809,13 +821,14 @@ class QemuUserServiceBackend(EmulationBackend):
             }
             save_json(self._service_dir(service) / "runtime.json", result)
             return result
-        service_rootfs = self.workspace.dynamic_dir / "service-rootfs" / service
+        if len(guest_parts(service)) != 1:
+            raise ValueError("service must be a single guest component")
+        service_rootfs = self.workspace.dynamic_dir / "service-rootfs" / (service + "-" + uuid.uuid4().hex)
         prepared = prepare_service_rootfs(rootfs, service_rootfs, profile)
         repairs = list(prepared["repairs"])
         if profile.config.get("ssl.engine") == "enable":
-            rand_file = service_rootfs / "etc" / "ssl" / "private" / ".rand"
-            rand_file.parent.mkdir(parents=True, exist_ok=True)
-            rand_file.write_bytes(os.urandom(4096))
+            with GuestRoot(service_rootfs) as owned:
+                owned.write_new("/etc/ssl/private/.rand", os.urandom(4096))
             profile.environment["RANDFILE"] = "/etc/ssl/private/.rand"
             repairs.append(
                 {
@@ -838,9 +851,8 @@ class QemuUserServiceBackend(EmulationBackend):
         mapping = self._runtime_mapping()
         qemu = shutil.which(mapping.emulator) if mapping else None
         if qemu:
-            qemu_target = service_rootfs / "usr" / "bin" / mapping.emulator
-            qemu_target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(qemu, qemu_target)
+            with GuestRoot(service_rootfs) as owned:
+                owned.write_new("/usr/bin/" + mapping.emulator, Path(qemu).read_bytes(), mode=0o700)
         result = {
             "success": True,
             "service": service,
@@ -858,6 +870,7 @@ class QemuUserServiceBackend(EmulationBackend):
         save_json(service_dir / "preparation.json", result)
         return result
 
+    @deny_unisolated_execution
     def start_service(
         self,
         service: str,
@@ -1037,13 +1050,14 @@ class QemuUserServiceBackend(EmulationBackend):
         if profile.service != "lighttpd" or not profile.config_files:
             return {"success": False, "errors": ["FastCGI repair is only supported for reconstructed lighttpd profiles"]}
         source_config = profile.config_files[0]
-        source_path = runtime_rootfs / source_config.lstrip("/")
+        source_path = guest_path(runtime_rootfs, source_config)
         if not source_path.exists():
             return {"success": False, "errors": [f"lighttpd config not found: {source_config}"]}
         runtime_config = str(PurePosixPath(source_config).with_name("lighttpd.fwagent-runtime.conf"))
-        runtime_path = runtime_rootfs / runtime_config.lstrip("/")
-        repaired = _lighttpd_without_fastcgi(source_path.read_text(encoding="utf-8", errors="replace"))
-        runtime_path.write_text(repaired, encoding="utf-8")
+        runtime_path = guest_path(runtime_rootfs, runtime_config)
+        repaired = _lighttpd_without_fastcgi(safe_read_text(source_path, limit=-1, errors="replace"))
+        with GuestRoot(runtime_rootfs) as owned:
+            owned.write_new(runtime_config, repaired.encode("utf-8"))
         return {
             "success": True,
             "id": "RR-0005",
@@ -1077,19 +1091,20 @@ class QemuUserServiceBackend(EmulationBackend):
         if profile.service != "lighttpd" or not profile.config_files:
             return {"success": False, "errors": ["external FastCGI repair requires a reconstructed lighttpd profile"]}
         source_config = profile.config_files[0]
-        source_path = runtime_rootfs / source_config.lstrip("/")
+        source_path = guest_path(runtime_rootfs, source_config)
         if not source_path.exists():
             return {"success": False, "errors": [f"lighttpd config not found: {source_config}"]}
         runtime_config = str(PurePosixPath(source_config).with_name("lighttpd.fwagent-fastcgi-external.conf"))
-        runtime_path = runtime_rootfs / runtime_config.lstrip("/")
+        runtime_path = guest_path(runtime_rootfs, runtime_config)
         repaired = _lighttpd_external_fastcgi(
-            source_path.read_text(encoding="utf-8", errors="replace"),
+            safe_read_text(source_path, limit=-1, errors="replace"),
             socket_guest=socket_guest,
             host=host,
             port=port,
             endpoint=endpoint,
         )
-        runtime_path.write_text(repaired, encoding="utf-8")
+        with GuestRoot(runtime_rootfs) as owned:
+            owned.write_new(runtime_config, repaired.encode("utf-8"))
         repair = RuntimeRepair(
             id="RR-3501",
             type="external_fastcgi_lifecycle_parity",
@@ -1179,6 +1194,7 @@ class QemuUserServiceBackend(EmulationBackend):
         save_application_json(self._application_dir(backend) / "profile.json", result)
         return result
 
+    @deny_unisolated_execution
     def trace_application_startup(
         self,
         backend: str = "device_manager",
@@ -1219,6 +1235,7 @@ class QemuUserServiceBackend(EmulationBackend):
         save_application_json(app_dir / "trace.json", payload)
         return payload
 
+    @deny_unisolated_execution
     def get_direct_application_context(self, backend: str = "device_manager", *, timeout_seconds: int = 10) -> dict[str, Any]:
         prepared = self.prepare_service("lighttpd", force_reconstruct=True)
         if not prepared.get("success"):
@@ -1249,6 +1266,7 @@ class QemuUserServiceBackend(EmulationBackend):
         (direct_dir / "trace.log").write_text(stderr, encoding="utf-8")
         return payload
 
+    @deny_unisolated_execution
     def get_fastcgi_application_context(self, backend: str = "device_manager", *, timeout_seconds: int = 10) -> dict[str, Any]:
         rootfs = self._rootfs()
         if rootfs is None:
@@ -1268,6 +1286,7 @@ class QemuUserServiceBackend(EmulationBackend):
         save_application_json(self._application_dir(backend) / "fastcgi_context.json", payload)
         return payload
 
+    @deny_unisolated_execution
     def compare_application_runtime_contexts(self, backend: str = "device_manager") -> dict[str, Any]:
         app_dir = self._application_dir(backend)
         direct_path = app_dir / "direct_exec" / "context.json"
@@ -1294,6 +1313,7 @@ class QemuUserServiceBackend(EmulationBackend):
         save_application_json(app_dir / "startup_graph.json", result)
         return result
 
+    @deny_unisolated_execution
     def start_fastcgi_harness(
         self,
         backend: str = "device_manager",
@@ -1332,6 +1352,7 @@ class QemuUserServiceBackend(EmulationBackend):
         save_application_json(app_dir / "harness_result.json", result)
         return result
 
+    @deny_unisolated_execution
     def get_fastcgi_runtime_context(
         self,
         backend: str = "device_manager",
@@ -1400,6 +1421,7 @@ class QemuUserServiceBackend(EmulationBackend):
         save_application_json(app_dir / f"{mode}_runtime_snapshot.json", result)
         return result
 
+    @deny_unisolated_execution
     def compare_fastcgi_runtime(self, backend: str = "device_manager") -> dict[str, Any]:
         standalone = self.get_fastcgi_runtime_context(backend, mode="standalone")
         lighttpd = self.get_fastcgi_runtime_context(backend, mode="lighttpd")
@@ -1415,6 +1437,7 @@ class QemuUserServiceBackend(EmulationBackend):
         save_application_json(self._application_dir(backend) / "runtime_diff.json", result)
         return result
 
+    @deny_unisolated_execution
     def get_fastcgi_child_failure(self, backend: str = "device_manager", *, stability_seconds: int = 5) -> dict[str, Any]:
         startup = self.start_application_backend(backend, stability_seconds=stability_seconds)
         app_dir = self._application_dir(backend)
@@ -1441,6 +1464,7 @@ class QemuUserServiceBackend(EmulationBackend):
         save_application_json(app_dir / "child_failure.json", result)
         return result
 
+    @deny_unisolated_execution
     def validate_fastcgi_integration(
         self,
         backend: str = "device_manager",
@@ -1680,6 +1704,7 @@ class QemuUserServiceBackend(EmulationBackend):
         save_application_json(app_dir / "integration_validation.json", result)
         return result
 
+    @deny_unisolated_execution
     def start_application_backend(
         self,
         backend: str = "device_manager",
@@ -1905,8 +1930,10 @@ class QemuUserServiceBackend(EmulationBackend):
         return attempt
 
     def _service_dir(self, service: str) -> Path:
-        path = self.workspace.dynamic_dir / "services" / service
-        path.mkdir(parents=True, exist_ok=True)
+        service = artifact_name(service)
+        path = guest_path(self.workspace.dynamic_dir, "/services/" + service)
+        with GuestRoot(self.workspace.dynamic_dir) as owned:
+            owned.mkdir("/services/" + service)
         return path
 
     def _load_or_reconstruct_profile(self, service: str, *, force_reconstruct: bool = False) -> ServiceLaunchProfile:
@@ -1919,9 +1946,10 @@ class QemuUserServiceBackend(EmulationBackend):
         return reconstruct_service_startup(rootfs, service)
 
     def _application_dir(self, backend: str) -> Path:
-        path = self.workspace.dynamic_dir / "application" / backend
-        path.mkdir(parents=True, exist_ok=True)
-        (path / "logs").mkdir(parents=True, exist_ok=True)
+        backend = artifact_name(backend)
+        path = guest_path(self.workspace.dynamic_dir, "/application/" + backend)
+        with GuestRoot(self.workspace.dynamic_dir) as owned:
+            owned.mkdir("/application/" + backend + "/logs")
         return path
 
     def _service_command(

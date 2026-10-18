@@ -9,9 +9,9 @@ from typing import Any
 from fwagent.config import Round2Config, load_round2_config
 from fwagent.models import ToolResult
 from fwagent.runtime.command import CommandRunner
-from fwagent.runtime.ghidra import GhidraRuntime
+from fwagent.runtime.ghidra import ExportValidationError, GhidraRuntime, validate_export_payload
 from fwagent.tools.architecture import parse_elf_header
-from fwagent.tools.common import extract_ascii_strings, sha256_file
+from fwagent.tools.common import extract_ascii_strings, is_elf, is_regular_file, sha256_file
 
 
 DANGEROUS_NAMES = {
@@ -52,14 +52,14 @@ class BinaryToolAPI:
 
     def analyze_binary(self, binary: str | Path, *, force: bool = False, allow_fallback: bool = True) -> dict[str, Any]:
         start = time.monotonic()
-        binary_path = Path(binary).resolve()
-        if not binary_path.exists():
+        binary_path = Path(binary).absolute()
+        if not is_regular_file(binary_path) or not is_elf(binary_path):
             return ToolResult(
                 success=False,
                 tool="ghidra.analyze_binary",
                 binary=str(binary_path),
                 duration=0,
-                errors=["binary does not exist"],
+                errors=["binary must be an ordinary ELF file"],
                 result={},
             ).to_dict()
 
@@ -76,15 +76,24 @@ class BinaryToolAPI:
 
         cache_path = self._cache_path(binary_path)
         if cache_path.exists() and not force:
-            cached = _load_json(cache_path)
-            return ToolResult(
-                success=True,
-                tool="ghidra.analyze_binary",
-                binary=str(binary_path),
-                duration=round(time.monotonic() - start, 3),
-                result=cached,
-                warnings=["cache hit"],
-            ).to_dict()
+            try:
+                cached = _load_json(cache_path)
+                if not isinstance(cached, dict):
+                    raise ValueError("cache must be an object")
+                metadata = cached.get("metadata") or {}
+                if not isinstance(metadata, dict):
+                    raise ValueError("cache metadata must be an object")
+                if not metadata.get("fallback"):
+                    validate_export_payload(cached, expected_hash=sha256_file(binary_path))
+                elif not allow_fallback:
+                    raise ValueError("fallback cache cannot satisfy no-fallback request")
+                elif not isinstance(cached.get("summary"), dict) or cached["summary"].get("sha256") != sha256_file(binary_path):
+                    raise ValueError("fallback cache target mismatch")
+            except (OSError, ValueError, UnicodeError) as exc:
+                return ToolResult(success=False, tool="ghidra.analyze_binary", binary=str(binary_path), duration=round(time.monotonic()-start, 3),
+                                  result={"metadata": {"error_code": "GHIDRA_CACHE_INVALID"}}, errors=[f"GHIDRA_CACHE_INVALID: {exc}"]).to_dict()
+            return ToolResult(success=True, tool="ghidra.analyze_binary", binary=str(binary_path),
+                              duration=round(time.monotonic()-start, 3), result=cached, warnings=["cache hit"]).to_dict()
 
         environment = self.runtime.check_environment()
         warnings: list[str] = []
@@ -94,6 +103,9 @@ class BinaryToolAPI:
         fallback_reason = None
         if environment["success"]:
             ghidra_result = self.runtime.export_binary(binary_path).to_dict()
+            failure_code = (ghidra_result.get("result", {}).get("metadata") or {}).get("error_code")
+            if failure_code in {"GHIDRA_OUTPUT_MISSING", "GHIDRA_JSON_INVALID", "GHIDRA_OUTPUT_INVALID", "GHIDRA_TARGET_MISMATCH", "GHIDRA_OUTPUT_UNREADABLE"}:
+                return ghidra_result
             if ghidra_result["success"]:
                 ghidra_payload = ghidra_result["result"] if isinstance(ghidra_result.get("result"), dict) else {}
                 runtime_metadata = ghidra_payload.get("metadata", {}) if isinstance(ghidra_payload.get("metadata"), dict) else {}
@@ -123,6 +135,9 @@ class BinaryToolAPI:
         container_environment = self.runtime.check_container_environment()
         if container_environment.get("success"):
             container_result = self.runtime.export_binary_containerized(binary_path).to_dict()
+            failure_code = (container_result.get("result", {}).get("metadata") or {}).get("error_code")
+            if failure_code in {"GHIDRA_OUTPUT_MISSING", "GHIDRA_JSON_INVALID", "GHIDRA_OUTPUT_INVALID", "GHIDRA_TARGET_MISMATCH", "GHIDRA_OUTPUT_UNREADABLE"}:
+                return container_result
             if container_result["success"]:
                 result_payload = container_result.get("result") if isinstance(container_result.get("result"), dict) else {}
                 container_meta = container_environment.get("result") if isinstance(container_environment.get("result"), dict) else {}
@@ -230,6 +245,8 @@ class BinaryToolAPI:
         return _wrap("ghidra.search_functions", binary, analysis, {"query": query, "functions": matches})
 
     def decompile_function(self, binary: str | Path, function: str) -> dict[str, Any]:
+        if not is_regular_file(Path(binary)) or not is_elf(Path(binary)):
+            return ToolResult(success=False, tool="ghidra.decompile_function", binary=str(binary), result={}, errors=["binary is not an ordinary file"]).to_dict()
         environment = self.runtime.check_environment()
         if environment["success"]:
             result = self.runtime.decompile_function(binary, function).to_dict()
@@ -280,6 +297,7 @@ class BinaryToolAPI:
         return _wrap("ghidra.find_function_references", binary, analysis, {"function": function, "references": references})
 
     def _fallback_analyze(self, binary: Path) -> dict[str, Any]:
+        if not is_elf(binary):raise ValueError("static fallback requires an ELF asset")
         header = parse_elf_header(binary) or {}
         strings = extract_ascii_strings(binary, max_bytes=self.config.ghidra.max_binary_size_mb * 1024 * 1024)
         functions = self._functions_from_nm(binary)
@@ -394,6 +412,7 @@ class BinaryToolAPI:
         return edges
 
     def _fallback_disassemble_function(self, binary: Path, function: str) -> str:
+        if not is_elf(binary):raise ValueError("disassembly fallback requires an ELF asset")
         result = self.runner.run(["objdump", "-d", str(binary)], timeout=30)
         if result.exit_code != 0:
             return ""
@@ -422,6 +441,7 @@ class BinaryToolAPI:
 
 
 def _normalize_ghidra_result(binary: Path, result: dict[str, Any], version: str) -> dict[str, Any]:
+    validate_export_payload(result, expected_hash=sha256_file(binary))
     summary = result.get("summary") or {}
     functions = result.get("functions") or []
     imports = result.get("imports") or []

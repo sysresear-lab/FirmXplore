@@ -5,7 +5,7 @@ from pathlib import Path
 
 from fwagent.runtime.command import CommandRunner
 from fwagent.tools.architecture import parse_elf_header
-from fwagent.tools.common import display_path, extract_ascii_strings
+from fwagent.tools.common import display_path, extract_ascii_strings, is_regular_file
 
 
 DANGEROUS_FUNCTIONS = (
@@ -51,7 +51,7 @@ def analyze_binaries(
     binaries: list[dict] = []
     for entry in elf_files:
         path = root / entry.lstrip("/") if entry.startswith("/") else Path(entry)
-        if not path.exists():
+        if not is_regular_file(path):
             continue
         header = parse_elf_header(path) or {}
         strings = extract_ascii_strings(path, max_bytes=16 * 1024 * 1024)

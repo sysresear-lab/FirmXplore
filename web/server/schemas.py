@@ -7,7 +7,9 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from .task_config import public_task_config
 
 
 class ConfigUpdate(BaseModel):
@@ -49,6 +51,11 @@ class TaskOut(BaseModel):
     error: str | None = None
     duration_seconds: float | None = None
     file_size: int | None = None
+
+    @field_validator("config_json", mode="before")
+    @classmethod
+    def public_snapshot(cls, value):
+        return public_task_config(value)
 
 
 class AnalyzeResponse(BaseModel):

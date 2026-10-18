@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from fwagent.runtime.command import CommandRunner
-from fwagent.tools.common import sha256_file
+from fwagent.tools.common import open_regular_file, sha256_file
 
 
 FORMAT_SIGNATURES: list[tuple[str, bytes]] = [
@@ -68,5 +68,5 @@ def detect_formats(data: bytes, file_output: str = "") -> list[str]:
 
 
 def _read_prefix(path: Path, size: int) -> bytes:
-    with path.open("rb") as handle:
+    with open_regular_file(path) as handle:
         return handle.read(size)

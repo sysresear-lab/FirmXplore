@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from fwagent.runtime.execution_policy import deny_unisolated_execution
+
 import os
 import signal
 import socket
@@ -68,6 +70,7 @@ def parse_fastcgi_response(data: bytes) -> dict[str, Any]:
     }
 
 
+@deny_unisolated_execution
 def run_fastcgi_harness(
     command: list[str],
     *,

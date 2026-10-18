@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from fwagent.runtime.execution_policy import deny_unisolated_execution
+
 import argparse
 import json
 from pathlib import Path
@@ -207,6 +209,7 @@ def summarize_accepted_integration(workspace: DynamicWorkspace, rootfs_artifact:
     return summary
 
 
+@deny_unisolated_execution
 def validate_task(workspace_root: Path, task_id: str) -> dict[str, Any]:
     workspace = DynamicWorkspace(workspace_root, task_id)
     report = workspace.load_report()

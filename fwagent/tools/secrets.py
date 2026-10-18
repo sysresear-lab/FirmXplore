@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from fwagent.tools.common import display_path, iter_files, safe_exists, safe_read_text
+from fwagent.tools.common import display_path, is_regular_file, iter_files, safe_exists, safe_read_text
 
 
 PRIVATE_KEY_MARKERS = (
@@ -169,7 +169,7 @@ def _scan_passwd_shadow(root: Path) -> list[dict]:
 
 
 def _safe_exists_regular(path: Path) -> bool:
-    return safe_exists(path)
+    return safe_exists(path) and is_regular_file(path)
 
 
 def _dedupe_findings(findings: list[dict]) -> list[dict]:

@@ -70,7 +70,7 @@ class ModelProvider:
     # ------------------------------------------------------------------
     # 对外入口
     # ------------------------------------------------------------------
-    def chat(self, messages: list[dict[str, Any]], *, max_tokens: int = 256, temperature: float = 0.0) -> dict[str, Any]:
+    def chat(self, messages: list[dict[str, Any]], *, max_tokens: int = 256, temperature: float = 0.0, max_attempts: int | None = None) -> dict[str, Any]:
         messages = self._trim_messages(messages)
         payload = {
             "model": self.config.model,
@@ -83,17 +83,20 @@ class ModelProvider:
         start = time.monotonic()
         last_error: ModelProviderError | None = None
 
-        for attempt in range(1 + self.MAX_RETRIES):
+        attempts = 1 + self.MAX_RETRIES if max_attempts is None else min(1 + self.MAX_RETRIES, max(1, max_attempts))
+        for attempt in range(attempts):
             try:
                 data = self._post_chat(body)
                 duration = round(time.monotonic() - start, 3)
                 result = self._parse_chat_response(data, duration)
                 self._log_usage(usage=data.get("usage"), duration=duration, status="success", attempt=attempt + 1)
+                result["request_attempts"] = attempt + 1
                 return result
             except ModelProviderError as exc:
                 last_error = exc
                 retryable = self._is_retryable(exc)
-                exhausted = attempt >= self.MAX_RETRIES
+                exhausted = attempt + 1 >= attempts
+                exc.attempts_used = attempt + 1
                 self._log_usage(
                     usage=None,
                     duration=round(time.monotonic() - start, 3),
@@ -107,7 +110,7 @@ class ModelProvider:
                 logger.warning(
                     "transient model request failure (attempt %d/%d, retry in %.1fs): %s",
                     attempt + 1,
-                    self.MAX_RETRIES + 1,
+                    attempts,
                     delay,
                     exc,
                 )

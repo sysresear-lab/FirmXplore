@@ -22,6 +22,8 @@ class Task(Base):
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     filename: Mapped[str] = mapped_column(String(512), nullable=False)
+    # Null means legacy/unclaimed: never exposed or automatically adopted.
+    owner_id: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
 
     # pending -> running -> success / failed
     status: Mapped[str] = mapped_column(String(16), default="pending", index=True, nullable=False)
@@ -57,3 +59,11 @@ class AppConfig(Base):
     key: Mapped[str] = mapped_column(String(64), primary_key=True)
     value: Mapped[str | None] = mapped_column(Text, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
+
+
+class TaskCredential(Base):
+    """Private encrypted per-task credential; never part of TaskOut or artifacts."""
+    __tablename__ = "task_credentials"
+    task_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    owner_id: Mapped[str] = mapped_column(String(32), nullable=False)
+    ciphertext: Mapped[str] = mapped_column(Text, nullable=False)
