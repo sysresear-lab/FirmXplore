@@ -1,0 +1,15 @@
+FROM firmxplore-dynamic:latest AS helper-build
+RUN apt-get update && apt-get install -y --no-install-recommends binutils-mipsel-linux-gnu && rm -rf /var/lib/apt/lists/*
+COPY docker/isolated-http-config.mipsel.s /tmp/config.s
+RUN mipsel-linux-gnu-as -EL -mips32 -o /tmp/config.o /tmp/config.s && mipsel-linux-gnu-ld -static -e _start -o /tmp/config-sender /tmp/config.o
+
+FROM firmxplore-dynamic:latest
+COPY --from=helper-build /tmp/config-sender /opt/fwagent/http-config-sender.mipsel
+
+# The historical dynamic image contains a truncated MIPSEL 4.1 kernel.
+# Official release: pr0v3rbs/FirmAE_kernel-v4.1, v1.0/vmlinux.mipsel.4.
+COPY docker/firmae-binaries/vmlinux.mipsel.4 /opt/FirmAE/binaries/vmlinux.mipsel.4
+RUN echo 'aeaa2a3cc13af5fe8f5cc4dc66c756b75051b972937862656a6e39e936da2d2f  /opt/FirmAE/binaries/vmlinux.mipsel.4' | sha256sum -c -
+
+COPY scripts/validate_kernel_elf.py /opt/fwagent/validate_kernel_elf.py
+RUN python /opt/fwagent/validate_kernel_elf.py /opt/FirmAE/binaries/vmlinux.mipsel.4 /opt/FirmAE/binaries/vmlinux.mipseb.4

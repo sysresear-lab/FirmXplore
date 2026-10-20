@@ -2013,6 +2013,9 @@ class QemuUserServiceBackend(EmulationBackend):
 def create_backend(config: DynamicConfig, workspace: str | Path) -> EmulationBackend:
     caps = detect_capabilities()
     backend = config.backend.lower()
+    if backend == 'isolated-qemu':
+        from fwagent.dynamic.isolated_docker import IsolatedDockerBackend
+        return IsolatedDockerBackend(workspace)
     if backend in {"service", "service-qemu", "qemu-user-service"}:
         return QemuUserServiceBackend(workspace)
     if backend in {"qemu", "docker-qemu"} or caps.compatible_backend:

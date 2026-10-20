@@ -768,7 +768,8 @@ class DynamicToolAPI:
 
     def _prepare_firmware(self, args: dict[str, Any]) -> dict[str, Any]:
         self.state.transition("preparing")
-        result = self.workspace.prepare_firmware()
+        result = (self.backend.prepare(None) if self.backend.name == 'isolated-qemu'
+                  else self.workspace.prepare_firmware())
         if result["success"]:
             self.state.transition("not_started")
         else:
@@ -781,7 +782,7 @@ class DynamicToolAPI:
         if getattr(self.backend.boot, "execution_blocked", False):
             return {"success": False, "tool": "dynamic.boot_firmware", "result": blocked_execution("dynamic.boot_firmware")}
         firmware = self.workspace.resolve_firmware()
-        if not firmware:
+        if not firmware and self.backend.name != 'isolated-qemu':
             return {"success": False, "tool": "dynamic.boot_firmware", "errors": ["firmware not found"]}
         self.state.transition("booting")
         self.state.boot_started_at = _now()
@@ -789,9 +790,17 @@ class DynamicToolAPI:
         timeout = int(args.get("timeout") or self.config.boot.timeout_seconds)
         result = self.backend.boot(firmware, timeout=timeout)
         if result.get("success"):
-            self.state.transition("running")
+            self.state.transition("stopped" if result.get('execution_completed') else "running")
             self.state.boot_completed_at = _now()
-            self._auto_evidence("boot_success", "Firmware boot completed", "dynamic.boot", result)
+            if result.get('emulation_scope') in {'userspace_service', 'reconstructed_linux_vm'}:
+                self._auto_evidence('process_started', 'Firmware binary executed under isolated QEMU; original vendor boot parity not established', 'dynamic.boot', result)
+                for response in result.get('http_responses', []):
+                    self._auto_evidence('http_response', f"Reconstructed guest returned HTTP {response['status']} from {response['url']}",
+                                        'dynamic.boot', {'success': True, 'response': response,
+                                                         'runtime_observation_real': True,
+                                                         'scope': 'reconstructed guest service reachability only'}, target=response['url'])
+            else:
+                self._auto_evidence("boot_success", "Firmware boot completed", "dynamic.boot", result)
         else:
             diagnosis = result.get("diagnosis", "backend_error")
             self.state.errors.append({"code": diagnosis, "message": "; ".join(result.get("errors", []) or ["boot failed"])})

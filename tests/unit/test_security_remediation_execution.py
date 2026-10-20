@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ast
+import io
 import json
 import os
 from pathlib import Path
@@ -108,7 +109,8 @@ class ExecutionPolicyTests(unittest.TestCase):
     def test_host_static_tools_and_version_only_queries_remain_available(self):
         runner = CommandRunner(self.base / 'logs')
         for command in (['readelf', '-h', '/root/qemu-arm-static'], ['file', '/ordinary'], ['qemu-arm-static', '--version']):
-            with self.subTest(command=command), patch('fwagent.runtime.command.subprocess.run', return_value=SimpleNamespace(returncode=0, stdout='STATIC_FIXTURE', stderr='')) as fake:
+            process = SimpleNamespace(returncode=0, stdout=io.BytesIO(b'STATIC_FIXTURE'), stderr=io.BytesIO(b''), wait=lambda **kwargs: 0)
+            with self.subTest(command=command), patch('fwagent.runtime.command.subprocess.Popen', return_value=process) as fake:
                 self.assertEqual(runner.run(command).exit_code, 0)
                 fake.assert_called_once();self.assertFalse(fake.call_args.kwargs['shell'])
 

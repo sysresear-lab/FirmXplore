@@ -187,6 +187,7 @@ def build_parser() -> argparse.ArgumentParser:
     emulate.add_argument("--workspace", default="workspace", help="Workspace root directory")
     emulate.add_argument("--config", default=None, help="Round 3 dynamic config path")
     emulate.add_argument("--timeout", type=int, default=None, help="Boot timeout in seconds")
+    emulate.add_argument("--backend", choices=["isolated-qemu", "firmae", "docker-qemu", "service-qemu"], default=None, help="Override the emulation backend")
 
     emulate_status = subparsers.add_parser("emulate-status", help="Show emulation state for a task")
     emulate_status.add_argument("task_id")
@@ -790,6 +791,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "emulate":
         config = load_dynamic_config(args.config)
+        if args.backend:
+            config = replace(config, backend=args.backend)
         api = DynamicToolAPI(args.workspace, args.task_id, config=config)
         prepare = api.execute("dynamic.prepare_firmware", {})
         boot = api.execute("dynamic.boot_firmware", {"timeout": args.timeout} if args.timeout else {})
