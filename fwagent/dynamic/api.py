@@ -799,6 +799,14 @@ class DynamicToolAPI:
                                         'dynamic.boot', {'success': True, 'response': response,
                                                          'runtime_observation_real': True,
                                                          'scope': 'reconstructed guest service reachability only'}, target=response['url'])
+                validation = result.get('functional_validation') or {}
+                checks = validation.get('checks') or {}
+                if checks.get('readonly_handler_observed') and checks.get('authenticated_status_page'):
+                    self._auto_evidence('application_response', 'Authenticated read-only management data observed in reconstructed guest',
+                                        'dynamic.boot', {'success':True,'runtime_observation_real':True,
+                                                         'scope':'reconstructed guest management function only',
+                                                         'fields':checks.get('readonly_data_fields',[]),
+                                                         'request_records':validation.get('requests',[])}, target='guest_management_status')
             else:
                 self._auto_evidence("boot_success", "Firmware boot completed", "dynamic.boot", result)
         else:

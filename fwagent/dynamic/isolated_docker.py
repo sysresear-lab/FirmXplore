@@ -7,7 +7,7 @@ from pathlib import Path
 import tempfile
 import uuid
 
-from fwagent.dynamic import isolated_worker
+from fwagent.dynamic import isolated_worker, isolated_http_probe
 from fwagent.runtime.command import CommandRunner
 from fwagent.tools.common import is_regular_file, sha256_file
 
@@ -56,12 +56,13 @@ def seccomp_profile():
 class IsolatedDockerBackend:
     name = 'isolated-qemu'
 
-    def __init__(self, workspace, runner=None, image='firmxplore-isolated:latest'):
+    def __init__(self, workspace, runner=None, image='firmxplore-isolated:latest', *, functional_validation=False):
         self.task_dir = Path(workspace).resolve()
         self.output = self.task_dir/'dynamic/isolated'
         self.output.mkdir(parents=True, exist_ok=True)
         self.runner = runner or CommandRunner(self.output/'logs')
         self.image = image
+        self.functional_validation = bool(functional_validation)
 
     def _archive(self):
         path = self.task_dir/'canonical-rootfs.tar.gz'
@@ -80,8 +81,8 @@ class IsolatedDockerBackend:
         result = self.runner.run(['docker', 'image', 'inspect', self.image, '--format', '{{.Id}}'], timeout=15)
         return {'success': result.exit_code == 0, 'image': self.image, 'image_id': result.stdout.strip(), 'errors': [] if result.exit_code == 0 else [result.stderr]}
 
-    def boot(self, firmware_path=None, *, timeout=180):
-        timeout = max(20, min(180, int(timeout)))
+    def boot(self, firmware_path=None, *, timeout=300):
+        timeout = max(20, min(300, int(timeout)))
         name = 'firmxplore-isolated-' + uuid.uuid4().hex
         result = {'success': False, 'backend': self.name, 'emulation_scope': 'userspace_service',
                   'full_system_boot': False, 'process_started': False, 'runtime_observation_real': False,
@@ -121,6 +122,8 @@ class IsolatedDockerBackend:
                 worker_snapshot = scratch/'worker.py'
                 worker_bytes = Path(isolated_worker.__file__).read_bytes()
                 worker_snapshot.write_bytes(worker_bytes)
+                probe_snapshot = scratch/'http_probe.py'
+                probe_snapshot.write_bytes(Path(isolated_http_probe.__file__).read_bytes())
                 profile = scratch/'seccomp.json'
                 profile.write_text(json.dumps(seccomp_profile()), encoding='utf-8')
                 command = ['docker', 'create', '--rm', '--name', name, '--network', 'none', '--ipc', 'none',
@@ -133,8 +136,11 @@ class IsolatedDockerBackend:
                            '--tmpfs', '/tmp:rw,exec,nosuid,nodev,size=32m,mode=1777',
                            '--mount', f'type=bind,source={snapshot},target=/input/rootfs.tar.gz,readonly',
                            '--mount', f'type=bind,source={worker_snapshot},target=/worker.py,readonly',
+                           '--mount', f'type=bind,source={probe_snapshot},target=/http_probe.py,readonly',
                            '--workdir', '/work', '--entrypoint', '/usr/bin/timeout', environment['image_id'],
                            '-k', '3', str(timeout), 'python', '-I', '-B', '/worker.py']
+                if self.functional_validation:
+                    command.append('--functional')
                 # The daemon can create a container even if the client loses its
                 # response. Cleanup always addresses our generated unique name.
                 created = True
@@ -154,6 +160,7 @@ class IsolatedDockerBackend:
                     raise RuntimeError('daemon isolation settings verification failed')
                 result.update(image_id=environment['image_id'], isolation_settings_verified=True, input_sha256=digest,
                               worker_sha256=sha256_file(worker_snapshot), seccomp_sha256=sha256_file(profile))
+                result['http_probe_sha256'] = sha256_file(probe_snapshot)
                 execution = self.runner.run(['docker', 'start', '-a', name], timeout=timeout+15)
                 if execution.timed_out or execution.exit_code != 0:
                     raise RuntimeError('worker failed or timed out: ' + execution.stderr[-2000:])
@@ -175,8 +182,9 @@ class IsolatedDockerBackend:
                 'kernel_boot_observed', 'vendor_binary_observed', 'process_started',
                 'request_sent', 'response_observed', 'cleanup_succeeded')}
             summary.update(runtime_backend=self.name, endpoint_established=observed,
-                           dynamic_status='service_response_observed' if observed else 'emulated_no_response' if result.get('success') else 'runtime_failed',
+                           dynamic_status='functional_management_observed' if result.get('functional_validation',{}).get('functional_passed') else 'service_response_observed' if observed else 'emulated_no_response' if result.get('success') else 'runtime_failed',
                            http_responses=result.get('http_responses', []),
+                           functional_validation=result.get('functional_validation', {}),
                            runtime_repairs=result.get('vm', {}).get('runtime_repairs', []),
                            evidence_path='dynamic/isolated/result.json')
             (self.output.parent/'runtime_summary.json').write_text(json.dumps(summary, indent=2), encoding='utf-8')

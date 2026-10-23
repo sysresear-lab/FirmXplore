@@ -188,6 +188,7 @@ def build_parser() -> argparse.ArgumentParser:
     emulate.add_argument("--config", default=None, help="Round 3 dynamic config path")
     emulate.add_argument("--timeout", type=int, default=None, help="Boot timeout in seconds")
     emulate.add_argument("--backend", choices=["isolated-qemu", "firmae", "docker-qemu", "service-qemu"], default=None, help="Override the emulation backend")
+    emulate.add_argument("--functional", action="store_true", help="Check isolated guest login/status/logout; vendor onboarding sets a temporary test password")
 
     emulate_status = subparsers.add_parser("emulate-status", help="Show emulation state for a task")
     emulate_status.add_argument("task_id")
@@ -794,11 +795,17 @@ def main(argv: list[str] | None = None) -> int:
         if args.backend:
             config = replace(config, backend=args.backend)
         api = DynamicToolAPI(args.workspace, args.task_id, config=config)
+        if args.functional:
+            if api.backend.name != 'isolated-qemu':
+                print(json.dumps({'success':False,'errors':['--functional requires isolated-qemu']}))
+                return 1
+            api.backend.functional_validation = True
         prepare = api.execute("dynamic.prepare_firmware", {})
         boot = api.execute("dynamic.boot_firmware", {"timeout": args.timeout} if args.timeout else {})
         output = {"prepare": prepare, "boot": boot, "state": api.state.to_dict()}
         print(json.dumps(output, indent=2, sort_keys=True))
-        return 0 if boot.get("success") else 1
+        functional_passed = boot.get('result',{}).get('functional_validation',{}).get('functional_passed')
+        return 0 if boot.get("success") and (not args.functional or functional_passed) else 1
 
     if args.command == "emulate-status":
         config = load_dynamic_config(args.config)

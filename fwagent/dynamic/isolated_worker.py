@@ -24,6 +24,7 @@ import time
 
 MAX_BYTES = 128 * 1024 * 1024
 MAX_MEMBERS = 10000
+MAX_MEMBER_BYTES = 32 * 1024 * 1024
 
 
 def unpack(source: Path, root: Path) -> dict:
@@ -52,7 +53,7 @@ def unpack(source: Path, root: Path) -> dict:
                 target.mkdir(parents=True, exist_ok=True)
             elif member.isfile():
                 total += member.size
-                if member.size > 32 * 1024 * 1024 or total > MAX_BYTES:
+                if member.size > MAX_MEMBER_BYTES or total > MAX_BYTES:
                     raise ValueError('rootfs expanded byte budget exceeded')
                 target.parent.mkdir(parents=True, exist_ok=True)
                 stream = archive.extractfile(member)
@@ -80,6 +81,23 @@ def unpack(source: Path, root: Path) -> dict:
             raise ValueError('archive link conflicts with an existing entry')
         target.symlink_to(link)
     return {'members': count, 'expanded_bytes': total, 'skipped_special_entries': len(skipped)}
+
+
+def ensure_runtime_directory(root: Path, relative: str) -> None:
+    """Create a runtime directory through confined guest symlinks."""
+    root_resolved = root.resolve()
+    target = root / relative
+    resolved = target.resolve(strict=False)
+    if not resolved.is_relative_to(root_resolved):
+        raise ValueError(f'runtime directory escapes rootfs: {relative}')
+    if target.exists() or target.is_symlink():
+        if target.is_symlink():
+            resolved.mkdir(parents=True, exist_ok=True)
+            return
+        if not target.is_dir():
+            raise ValueError(f'runtime path is not a directory: {relative}')
+        return
+    resolved.mkdir(parents=True, exist_ok=True)
 
 
 def isolation_check() -> dict:
@@ -116,7 +134,7 @@ def read_tail(path: Path, limit=16000) -> str:
         return stream.read(limit).decode('utf-8', 'replace')
 
 
-def run_guest(prefix, args, label, timeout=10, env_extra=None):
+def run_guest(prefix, args, label, timeout=10, env_extra=None, on_ready=None):
     stdout = Path('/work') / (label + '.stdout')
     stderr = Path('/work') / (label + '.stderr')
     env = {'PATH': '/usr/bin:/bin:/usr/sbin:/sbin', 'HOME': '/tmp', 'PROOT_NO_SECCOMP': '1',
@@ -124,11 +142,15 @@ def run_guest(prefix, args, label, timeout=10, env_extra=None):
     with stdout.open('wb') as out, stderr.open('wb') as err:
         process = subprocess.Popen(prefix + args, stdout=out, stderr=err, env=env, start_new_session=True)
         timed_out = False
+        validation = None
         try:
             if label == 'vm':
                 deadline = time.monotonic() + timeout
                 while process.poll() is None and time.monotonic() < deadline:
                     text = read_tail(stdout, 65536)
+                    if on_ready and re.search(r'(?m)^FIRMXPLORE_VM_PROBE_READY\r?$', text):
+                        validation = on_ready()
+                        break
                     if 'Kernel panic' in text or 'FIRMXPLORE_VM_COMPLETE' in text:
                         break
                     time.sleep(0.2)
@@ -144,6 +166,7 @@ def run_guest(prefix, args, label, timeout=10, env_extra=None):
                 pass
             process.wait(timeout=5)
     return {'command': prefix + args, 'exit_code': process.returncode, 'timed_out': timed_out,
+            'functional_validation': validation,
             'stdout': read_tail(stdout), 'stderr': read_tail(stderr)}
 
 
@@ -249,7 +272,7 @@ def write_initramfs(root, target, compat_devices=()):
         entry('TRAILER!!!', 0)
 
 
-def run_vm(root, endian):
+def run_vm(root, endian, *, functional=False):
     import shutil
     bb = '/firmxplore/busybox'
     helper = Path('/opt/FirmAE/binaries')/('busybox.mipsel' if endian == 'little' else 'busybox.mipseb')
@@ -300,6 +323,7 @@ echo FIRMXPLORE_VM_INIT_READY
 if [ -f /etc/passwd.bak ]; then $BB cp /etc/passwd.bak /var/passwd; fi
 if [ -x /usr/bin/cos ]; then /usr/bin/cos >/tmp/cos.log 2>&1 & fi
 $BB sleep 5
+if [ -x /usr/bin/cos ] && [ -x /usr/bin/tmpd ]; then /usr/bin/tmpd >/tmp/tmpd.log 2>&1 & fi
 if [ -f /web/oem/model.conf ]; then
  /usr/bin/httpd -r >/tmp/httpd.log 2>&1 &
 else
@@ -309,9 +333,6 @@ fi
 # the wireless thread before continuing to its management HTTP setup.
 if [ -f /web/oem/model.conf ]; then $BB sleep 95; else $BB sleep 30; fi
 if [ -x /usr/bin/cos ]; then
- $BB killall httpd
- /usr/bin/httpd >/tmp/httpd-retry.log 2>&1 &
- $BB sleep 3
  if [ -x /firmxplore/http-config-sender ]; then /firmxplore/http-config-sender; $BB sleep 1; fi
 fi
 for IPT in /sbin/iptables /usr/bin/iptables; do
@@ -349,9 +370,22 @@ for PD in /proc/[0-9]*; do
  case "$CMD" in httpd|cos) echo "FIRMXPLORE_PROCESS $PD $CMD"; $BB cat "$PD/wchan"; $BB cat "$PD/syscall";; esac
 done
 $BB ps
+( $BB sleep 8
+ echo FIRMXPLORE_VM_POST_PROBE_PROCESSES
+ for PD in /proc/[0-9]*; do
+  CMD=$($BB cat "$PD/comm" 2>/dev/null)
+  case "$CMD" in httpd|cos) echo "FIRMXPLORE_PROCESS $PD $CMD"; $BB cat "$PD/wchan"; $BB cat "$PD/syscall";; esac
+ done
+ $BB grep -E 'sendto|msg_send|No such file' /tmp/httpd.log | $BB tail -c 2000
+ $BB grep -E '^#Msg: (2 pData|HashMatchFlag|cgi_gdpr request|ini header|getObjData_decrypt|http_rsa_decrypt)' /tmp/httpd.log | $BB tail -c 1000
+) &
+echo FIRMXPLORE_VM_PROBE_READY
+$BB sleep 100
 echo FIRMXPLORE_VM_COMPLETE
 $BB poweroff -f
 '''
+    if not functional:
+        script = script.replace('echo FIRMXPLORE_VM_PROBE_READY\n$BB sleep 100\n','')
     (root/'init').write_text(script)
     (root/'init').chmod(0o755)
     initrd = Path('/work/rootfs.cpio.gz')
@@ -364,10 +398,22 @@ $BB poweroff -f
     write_initramfs(root, initrd, compat_devices)
     kernel = '/opt/FirmAE/binaries/vmlinux.' + ('mipsel.4' if endian == 'little' else 'mipseb.4')
     emulator = '/usr/bin/qemu-system-' + ('mipsel' if endian == 'little' else 'mips')
+    network = 'user,id=isolated,restrict=on'
+    if functional:
+        network += ',net=192.168.0.0/24,host=192.168.0.2,hostfwd=tcp:127.0.0.1:18080-192.168.0.1:80'
     command = [emulator, '-M', 'malta', '-m', '256M', '-nographic', '-nodefaults', '-serial', 'stdio',
-               '-monitor', 'none', '-netdev', 'user,id=isolated,restrict=on', '-device', 'e1000,netdev=isolated', '-kernel', kernel, '-initrd', str(initrd),
+               '-monitor', 'none', '-netdev', network, '-device', 'e1000,netdev=isolated', '-kernel', kernel, '-initrd', str(initrd),
                '-append', 'console=ttyS0 rdinit=/init panic=1 mem=256M firmadyne.syscall=0 firmadyne.execute=0 FIRMAE_NVRAM=false']
-    vm = run_guest([], command, 'vm', timeout=140, env_extra={'QEMU_STRACE': ''})
+    def functional_check():
+        import importlib.util
+        spec = importlib.util.spec_from_file_location('isolated_http_probe', '/http_probe.py')
+        probe = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(probe)
+        observations = probe.run(root)
+        if observations.get('error_type'):
+            time.sleep(10)
+        return observations
+    vm = run_guest([], command, 'vm', timeout=250 if functional else 140, env_extra={'QEMU_STRACE': ''}, on_ready=functional_check if functional else None)
     console = Path('/work/vm.stdout').read_text(errors='replace') + vm['stderr']
     vm.update(vm_observations(console))
     vm['console'] = console[-32000:]
@@ -382,15 +428,23 @@ $BB poweroff -f
         vm['runtime_repairs'].append({'type': 'skip_unavailable_guest_nat_table', 'scope': 'NAT initialization only; NAT behavior is not validated', 'stock_vendor_parity': False})
     if config_replay:
         vm['runtime_repairs'].append({'type': 'baseline_http_configuration_message', 'message_type': '0x7ee', 'local_http_port': 80, 'authentication_modified': False, 'stock_vendor_parity': False})
+    if (root/'usr/bin/cos').is_file() and (root/'usr/bin/tmpd').is_file():
+        vm['runtime_repairs'].append({'type': 'vendor_ipc_dependency', 'program': '/usr/bin/tmpd', 'stock_vendor_parity': False})
     return vm
 
 
 def main():
     import resource
-    resource.setrlimit(resource.RLIMIT_FSIZE, (2 * 1024 * 1024, 32 * 1024 * 1024))
+    import sys
+    functional = '--functional' in sys.argv[1:]
+    # Extraction permits an individual regular member up to MAX_MEMBER_BYTES.
+    # Keep the process file-size limit aligned with that validated archive
+    # budget so ordinary firmware binaries above 2 MiB do not fail with EFBIG.
+    resource.setrlimit(resource.RLIMIT_FSIZE, (MAX_MEMBER_BYTES, MAX_MEMBER_BYTES))
     result = {'success': False, 'emulation_scope': 'userspace_service', 'full_system_boot': False,
               'process_started': False, 'request_sent': False, 'response_observed': False,
               'runtime_observation_real': False, 'execution_completed': True}
+    result['functional_validation_requested'] = functional
     try:
         result['isolation_checks'] = isolation_check()
         source = Path('/input/rootfs.tar.gz')
@@ -398,7 +452,7 @@ def main():
         root = Path('/work/rootfs')
         result['extraction'] = unpack(source, root)
         for name in ('tmp', 'var', 'var/run', 'var/tmp', 'var/log', 'dev', 'proc', 'sys'):
-            (root/name).mkdir(parents=True, exist_ok=True)
+            ensure_runtime_directory(root, name)
         busybox = root/'bin/busybox'
         data = busybox.read_bytes()[:64]
         if data[:4] != b'\x7fELF' or data[4] != 1 or data[5] not in (1, 2):
@@ -431,12 +485,13 @@ def main():
                 result['httpd_trace'] = run_guest(prefix, ['/usr/bin/httpd'], 'httpd-trace', timeout=4)
                 # Legacy LinuxThreads / vendor IPC assumptions need a guest
                 # kernel rather than host-translated userspace syscalls.
-                resource.setrlimit(resource.RLIMIT_FSIZE, (32*1024*1024, 32*1024*1024))
+                resource.setrlimit(resource.RLIMIT_FSIZE, (MAX_MEMBER_BYTES, MAX_MEMBER_BYTES))
                 vm_root = Path('/work/vm-rootfs')
                 unpack(source, vm_root)
                 for name in ('proc', 'sys', 'dev', 'tmp'):
-                    (vm_root/name).mkdir(parents=True, exist_ok=True)
-                result['vm'] = run_vm(vm_root, endian)
+                    ensure_runtime_directory(vm_root, name)
+                result['vm'] = run_vm(vm_root, endian, functional=functional)
+                result['functional_validation'] = result['vm'].get('functional_validation') or {}
                 if result['vm']['kernel_boot_observed']:
                     result.update(emulation_scope='reconstructed_linux_vm', kernel_boot_observed=True,
                                   vendor_binary_observed=result['vm']['vendor_binary_observed'],
@@ -444,7 +499,8 @@ def main():
                 if result['vm']['response_observed']:
                     result.update(response_observed=True, request_sent=True,
                                   http_responses=result['vm']['http_responses'])
-            result['emulation_level'] = ('http_response' if result['response_observed'] else
+            result['emulation_level'] = ('functional_management' if result.get('functional_validation',{}).get('functional_passed') else
+                                         'http_response' if result['response_observed'] else
                                          'guest_kernel_and_vendor_userspace' if result.get('vendor_binary_observed') else
                                          'userspace_binary')
         else:

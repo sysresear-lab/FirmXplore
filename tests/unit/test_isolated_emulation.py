@@ -10,7 +10,7 @@ import unittest
 from unittest.mock import patch
 
 from fwagent.dynamic.isolated_docker import IsolatedDockerBackend, seccomp_profile
-from fwagent.dynamic.isolated_worker import unpack, vm_observations
+from fwagent.dynamic.isolated_worker import ensure_runtime_directory, unpack, vm_observations
 from scripts.validate_kernel_elf import validate
 from fwagent.models import CommandResult
 
@@ -42,6 +42,13 @@ class IsolatedEmulationTests(unittest.TestCase):
         with patch('fwagent.dynamic.isolated_worker.MAX_BYTES', 4), self.assertRaises(ValueError):
             unpack(source, self.base/'root')
 
+    def test_regular_member_above_legacy_two_mib_limit_is_accepted(self):
+        payload = b'x' * (2 * 1024 * 1024 + 1)
+        source = self.archive([('rootfs/usr/bin/vendor-service', payload)])
+        result = unpack(source, self.base/'root')
+        self.assertEqual(result['expanded_bytes'], len(payload))
+        self.assertEqual((self.base/'root/usr/bin/vendor-service').stat().st_size, len(payload))
+
     def test_duplicate_regular_member_cannot_replace_prior_output(self):
         source = self.archive([('rootfs/a', b'first'), ('rootfs/a', b'second')])
         with self.assertRaises(ValueError):
@@ -70,6 +77,14 @@ class IsolatedEmulationTests(unittest.TestCase):
             archive.addfile(info)
         unpack(source, self.base/'root')
         self.assertEqual((self.base/'root/var').resolve(), self.base/'root/tmp')
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX link semantics are verified in the real Linux worker')
+    def test_runtime_directory_follows_confined_broken_symlink(self):
+        root = self.base/'root'
+        root.mkdir()
+        (root/'var').symlink_to('tmp')
+        ensure_runtime_directory(root, 'var/run')
+        self.assertTrue((root/'tmp/run').is_dir())
 
     def test_profile_cannot_create_mounts_or_namespaces(self):
         profile = seccomp_profile()
@@ -143,6 +158,7 @@ class IsolatedEmulationTests(unittest.TestCase):
         self.assertIn('--read-only', create)
         self.assertEqual(create[create.index('--network')+1], 'none')
         self.assertNotIn('--privileged', create)
+        self.assertNotIn('--functional',create)
 
 
 if __name__ == '__main__':

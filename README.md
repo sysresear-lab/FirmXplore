@@ -394,10 +394,8 @@ FirmXplore/
 ## 🤝 Team & Support
 
 <p align="left">
-  <img src="./assets/Falcons.png" height="30" style="vertical-align: middle;" alt="Falcons Lab"/>
-  <strong style="margin-left: 8px;">Falcons Lab</strong>
-  <img src="./assets/CTRA.png" height="30" style="vertical-align: middle; margin-left: 40px;" alt="CTRA@DGSSZ"/>
-  <strong style="margin-left: 8px;">CTRA@DGSSZ</strong>
+  <img src="./assets/sysresear-lab.png" height="30" style="vertical-align: middle;" alt="Falcons Lab"/>
+  <strong style="margin-left: 8px;">Sysresear Lab</strong>
 </p>
 
 <table>
@@ -407,6 +405,12 @@ FirmXplore/
         <img src="https://avatars.githubusercontent.com/u/196273893?v=4" width="70px" alt="Hailin Zheng"/>
       </a><br/>
       <a href="mailto:iszhenghailin@gmail.com"><sub><b>Hailin Zheng</b></sub></a>
+    </td>
+    <td align="center" width="90">
+      <a href="https://github.com/xiaohen711">
+        <img src="https://avatars.githubusercontent.com/u/204820747?v=4 width="70px" alt="Hailin Zheng"/>
+      </a><br/>
+      <a href="mailto:iszhenghailin@gmail.com"><sub><b>Shibing Deng</b></sub></a>
     </td>
     <td align="center" width="90">
       <a href="https://github.com/colorfulbird3">
