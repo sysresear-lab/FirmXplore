@@ -1,5 +1,7 @@
 # FirmXplore
 
+**English** | [简体中文](README.zh-CN.md)
+
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue)](https://www.python.org/)
 [![Docker](https://img.shields.io/badge/Docker-runtime-blue)](https://www.docker.com/)
 [![License](https://img.shields.io/badge/License-MIT-green)](pyproject.toml)
